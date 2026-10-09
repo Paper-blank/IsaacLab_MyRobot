@@ -1,0 +1,1 @@
+Fixed the my_exoskeleton task to restore the physical scene state after a fall and to spawn the URDF with its feet near the ground plane.

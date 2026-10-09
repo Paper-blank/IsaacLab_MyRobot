@@ -1,0 +1,27 @@
+version: 1
+description: Multimodal imitation reward contract for Isaac-MyExoskeleton-Imitation-v0.
+weights:
+  imu: 1.0
+  gyro: 0.5
+  joint: 0.5
+  velocity: 0.5
+  rgb: 0.25
+  event: 0.25
+sigmas:
+  imu_orientation_rad: 0.35
+  gyro_rad_s: 1.0
+  accelerometer_m_s2: 2.0
+  joint_position_rad: 0.35
+  velocity_m_s: 0.5
+  rgb_feature: 0.25
+  event_feature: 1.0
+channels:
+  imu_count: 6
+  imu_features: [roll_rad, pitch_rad, yaw_rad, gyro_x_rad_s, gyro_y_rad_s, gyro_z_rad_s, acc_x_m_s2, acc_y_m_s2, acc_z_m_s2]
+  rgb_feature_layout: [left_mean_rgb, right_mean_rgb, left_std_rgb, right_std_rgb]
+  # Four camera/polarity planes; each PPO frame is pooled to 2x4 spatial bins.
+  event_histogram_layout: [left_positive, left_negative, right_positive, right_negative]
+validity:
+  missing_motion: mask_joint_reward
+  missing_rgb: mask_rgb_reward
+  missing_event: mask_event_reward

@@ -1,0 +1,56 @@
+# Everything past this stage is to install
+# ROS 2 Jazzy and Gazebo Harmonic.
+
+# What is the docker name suffix for the base image to load? (defaults to empty string)
+ARG DOCKER_NAME_SUFFIX=""
+
+FROM isaac-lab-base${DOCKER_NAME_SUFFIX} AS ros2
+
+# Which ROS2 apt package to install
+ARG ROS2_APT_PACKAGE
+
+# The base Isaac Lab image ends as the non-root runtime user. Switch to root
+# for ROS apt setup, then restore the non-root user at the end.
+USER root
+
+# ROS 2 Jazzy apt installation. Ubuntu 24.04 (Noble) is the base image used by
+# Isaac Sim 6.0.1 and is the officially recommended platform for Jazzy.
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    software-properties-common && \
+    add-apt-repository universe && \
+    curl --fail --location --connect-timeout 10 --max-time 60 \
+      --output /tmp/ros2-apt-source.deb \
+      https://github.com/ros-infrastructure/ros-apt-source/releases/download/1.2.0/ros2-apt-source_1.2.0.noble_all.deb && \
+    dpkg -i /tmp/ros2-apt-source.deb && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ros-jazzy-${ROS2_APT_PACKAGE} \
+    ros-jazzy-vision-msgs \
+    ros-jazzy-rmw-cyclonedds-cpp \
+    ros-jazzy-rmw-fastrtps-cpp \
+    ros-jazzy-ros-gz \
+    ros-jazzy-gz-ros2-control \
+    ros-jazzy-ros2-control \
+    ros-jazzy-ros2-controllers \
+    ros-jazzy-robot-state-publisher \
+    ros-jazzy-xacro \
+    ros-dev-tools && \
+    ${ISAACLAB_PATH}/isaaclab.sh -p ${ISAACLAB_PATH}/tools/install_deps.py rosdep ${ISAACLAB_PATH}/source && \
+    apt -y autoremove && apt clean autoclean && \
+    rm -rf /var/lib/apt/lists/* && \
+    echo "source /opt/ros/jazzy/setup.bash" >> ${DOCKER_USER_HOME}/.bashrc
+
+ENV ROS_DISTRO=jazzy
+
+# Gazebo writes runtime logs under ~/.gz. The base image intentionally keeps
+# /root non-writable to the non-root runtime user, so create this child path
+# during the image build and assign it to that user.
+RUN mkdir -p ${DOCKER_USER_HOME}/.gz && \
+    chown -R isaaclab:isaaclab ${DOCKER_USER_HOME}/.gz
+
+# Copy the RMW specifications for ROS2
+# https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_ros.html
+COPY --chown=isaaclab:isaaclab docker/.ros/ ${DOCKER_USER_HOME}/.ros/
+
+USER isaaclab

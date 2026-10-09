@@ -1,0 +1,20 @@
+version: 2
+description: Direction calibration from the recorded exoskeleton channels to the Isaac Lab articulation frame.
+coordinate_calibration:
+  joint_sign: [1, 1, -1, 1, 1, -1, 1, 1]
+  # Recorder order: 01/02 ankle, 03/04 knee, 05/06 hip; odd IDs are left.
+  imu_sensor_sides: [left, right, left, right, left, right]
+  # Rows are output (joint) axes; columns are input (dataset) axes.
+  imu_axis_transforms:
+    right: [[0, 1, 0], [1, 0, 0], [0, 0, -1]]
+    left: [[0, -1, 0], [1, 0, 0], [0, 0, -1]]
+  # R_exo = R_joint_link @ R_link_sensor @ R_sensor_IMU. Mounting poses are
+  # unknown in the supplied data and therefore default to identity.
+  R_joint_link:
+    default: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  R_link_sensor:
+    default: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  orientation_mode: euler_components
+  imu_orientation_sign: [1, -1, 1]
+  imu_gyro_sign: [-1, -1, 1]
+  imu_accel_sign: [-1, -1, 1]

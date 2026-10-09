@@ -1,0 +1,528 @@
+<?xml version="1.0"?>
+<robot name="my_exoskeleton">
+
+  <!-- ==================== LINKS ==================== -->
+  <!-- base_link -->
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0.00752677452443917 0.171128138553816 1.12504728876771" rpy="0 0 0" />
+      <mass value="1.83001051933718" />
+      <inertia ixx="0.0161274678742981" ixy="0.000790730653050851" ixz="-0.00141128292755634" iyy="0.0077789768903444" iyz="-0.000109236006699094" izz="0.0115763344614671" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/base_link.STL" />
+      </geometry>
+      <material name=""><color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/base_link.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>5e6</kp><kd>100.0</kd></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <!-- top_mount -->
+  <link name="top_mount">
+    <inertial>
+      <origin xyz="0.03 0.17499 1.3993" rpy="0 0 0" />
+      <mass value="30.6913" />
+      <inertia ixx="0.010009" ixy="-0.00019404" ixz="-0.00036082" iyy="0.012378" iyz="9.668e-5" izz="0.0039013" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/top_mount.STL" />
+      </geometry>
+      <material name=""><color rgba="0 0.4 0 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/top_mount.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>5e6</kp><kd>100.0</kd></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="base_to_top_mount" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="top_mount" />
+    <axis xyz="0 0 0" />
+  </joint>
+
+  <!-- R_turn -->
+  <link name="R_turn">
+    <inertial>
+      <origin xyz="0.070122 -0.0015149 -0.067157" rpy="0 0 0" />
+      <mass value="0.67844" />
+      <inertia ixx="0.00081935" ixy="1.5767e-5" ixz="0.00022779" iyy="0.0014784" iyz="-1.6417e-5" izz="0.001" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/R_turn.STL" />
+      </geometry>
+      <material name=""><color rgba="0.79216 0.81961 0.93333 1" /></material>
+    </visual>
+    <!-- 添加碰撞几何 -->
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/R_turn.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>5e6</kp><kd>100.0</kd></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="base_to_Rturn" type="revolute">
+    <origin xyz="0.06512 -0.062129 1.0457" rpy="-0.0077468 0.16051 -0.056597" />
+    <parent link="base_link" />
+    <child link="R_turn" />
+    <axis xyz="0 0 1" />
+    <!-- 限位改为 ±90° (1.5708 rad) -->
+    <limit lower="-1.5708" upper="1.5708" effort="60" velocity="3.14" enable_limits="true" />
+    <!-- 降低阻尼 -->
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <!-- Rthigh -->
+  <link name="Rthigh">
+    <inertial>
+      <origin xyz="0.00051992 -0.28251 0.0065789" rpy="0 0 0" />
+      <mass value="1.5391" />
+      <inertia ixx="0.0083634" ixy="1.2637e-5" ixz="4.7872e-5" iyy="0.0025216" iyz="-0.00027965" izz="0.0096566" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Rthigh.STL" />
+      </geometry>
+      <material name=""><color rgba="0.79216 0.81961 0.93333 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Rthigh.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>5e6</kp><kd>100.0</kd></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="Rturn_to_Rthigh" type="revolute">
+    <origin xyz="0.084829 0.027015 -0.078" rpy="1.5708 -0.028419 0" />
+    <parent link="R_turn" />
+    <child link="Rthigh" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="60" velocity="3.14" enable_limits="true" />
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <!-- Rleg -->
+  <link name="Rleg">
+    <inertial>
+      <origin xyz="-0.018299 -0.24043 -0.0084666" rpy="0 0 0" />
+      <mass value="1.7451" />
+      <inertia ixx="0.0066167" ixy="0.00018606" ixz="-0.0016042" iyy="0.0060637" iyz="3.195e-5" izz="0.0081516" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Rleg.STL" />
+      </geometry>
+      <material name=""><color rgba="0.79216 0.81961 0.93333 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Rleg.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>5e6</kp><kd>100.0</kd></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="Rthigh_to_Rleg" type="revolute">
+    <origin xyz="-0.0011317 -0.457 -0.0184" rpy="0.0073185 0.057638 0.12637" />
+    <parent link="Rthigh" />
+    <child link="Rleg" />
+    <axis xyz="0 0 1" />
+    <!-- Right knee: q<0 is anatomical flexion; retain 0.05 rad extension margin. -->
+    <limit lower="-2.25" upper="0.05" effort="60" velocity="3.14" enable_limits="true" />
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <!-- Rfoot -->
+  <link name="Rfoot">
+    <inertial>
+      <origin xyz="0.065613 -0.086645 -0.06094" rpy="0 0 0" />
+      <mass value="1.0086" />
+      <inertia ixx="0.0032137" ixy="0.0003535" ixz="0.00044066" iyy="0.010845" iyz="-0.00049538" izz="0.010014" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Rfoot.STL" />
+      </geometry>
+      <material name=""><color rgba="0.79216 0.81961 0.93333 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Rfoot.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>50.0</mu><mu2>50.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>2e7</kp><kd>500.0</kd><soft_cfm>0.0001</soft_cfm><soft_erp>0.5</soft_erp></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="Rleg_to_Rfoot" type="revolute">
+    <origin xyz="0 -0.387 -0.021486" rpy="-1.3765e-5 -0.0022349 0.0061591" />
+    <parent link="Rleg" />
+    <child link="Rfoot" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="60" velocity="3.14" enable_limits="true" />
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <!-- Lturn -->
+  <link name="Lturn">
+    <inertial>
+      <origin xyz="0.0701219836711613 0.00151487482588952 -0.0671570554349163" rpy="0 0 0" />
+      <mass value="0.678438405222523" />
+      <inertia ixx="0.000819495161454876" ixy="-1.57675280785087e-5" ixz="0.000227302164156123" iyy="0.00147837892595868" iyz="1.64167068034042e-5" izz="0.000999870316225499" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Lturn.STL" />
+      </geometry>
+      <material name=""><color rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Lturn.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>5e6</kp><kd>100.0</kd></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="base_to_Lturn" type="revolute">
+    <origin xyz="0.025142 0.41703 1.0529" rpy="0.010494 0.16036 0.057468" />
+    <parent link="base_link" />
+    <child link="Lturn" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="60" velocity="3.14" enable_limits="true" />
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <!-- Lthigh -->
+  <link name="Lthigh">
+    <inertial>
+      <origin xyz="0.00051981 0.28251 0.0065789" rpy="0 0 0" />
+      <mass value="1.5391" />
+      <inertia ixx="0.008363" ixy="-1.2563e-5" ixz="4.7895e-5" iyy="0.002522" iyz="0.00027963" izz="0.0096566" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Lthigh.STL" />
+      </geometry>
+      <material name=""><color rgba="0.79216 0.81961 0.93333 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Lthigh.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>5e6</kp><kd>100.0</kd></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="Lturn_to_Lthigh" type="revolute">
+    <origin xyz="0.084829 -0.027015 -0.078" rpy="-1.5708 -0.10935 0" />
+    <parent link="Lturn" />
+    <child link="Lthigh" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="60" velocity="3.14" enable_limits="true" />
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <!-- Lleg -->
+  <link name="Lleg">
+    <inertial>
+      <origin xyz="-0.018298 0.24044 -0.0084654" rpy="0 0 0" />
+      <mass value="1.745" />
+      <inertia ixx="0.0066168" ixy="-0.00018533" ixz="-0.0016042" iyy="0.0060636" iyz="-3.15e-5" izz="0.0081512" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Lleg.STL" />
+      </geometry>
+      <material name=""><color rgba="0.79216 0.81961 0.93333 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Lleg.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>5e6</kp><kd>100.0</kd></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="Lthigh_to_Lleg" type="revolute">
+    <origin xyz="-0.0011317 0.457 -0.0184" rpy="-0.0013023 0.058085 -0.02243" />
+    <parent link="Lthigh" />
+    <child link="Lleg" />
+    <axis xyz="0 0 1" />
+    <!-- Left knee: mirrored axis, q>0 is anatomical flexion. -->
+    <limit lower="-0.05" upper="2.25" effort="60" velocity="3.14" enable_limits="true" />
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <!-- Lfoot -->
+  <link name="Lfoot">
+    <inertial>
+      <origin xyz="0.065613 0.088686 -0.05793" rpy="0 0 0" />
+      <mass value="1.0086" />
+      <inertia ixx="0.0032137" ixy="-0.00036841" ixz="0.00042826" iyy="0.01081" iyz="0.00052272" izz="0.010049" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Lfoot.STL" />
+      </geometry>
+      <material name=""><color rgba="0.79216 0.81961 0.93333 1" /></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/Lfoot.STL" />
+      </geometry>
+      <surface>
+        <friction><ode><mu>50.0</mu><mu2>50.0</mu2></ode></friction>
+        <bounce><restitution>0.0</restitution><threshold>1e6</threshold></bounce>
+        <contact><ode><kp>2e7</kp><kd>500.0</kd><soft_cfm>0.0001</soft_cfm><soft_erp>0.5</soft_erp></ode></contact>
+      </surface>
+    </collision>
+  </link>
+
+  <joint name="Lleg_to_Lfoot" type="revolute">
+    <origin xyz="0 0.387 -0.021486" rpy="-0.034273 -0.002234 -0.029117" />
+    <parent link="Lleg" />
+    <child link="Lfoot" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="60" velocity="3.14" enable_limits="true" />
+    <dynamics damping="0.1" friction="0.0"/>
+  </joint>
+
+  <!-- ==================== ROS2 CONTROL (gz_ros2_control) ==================== -->
+  <ros2_control name="GazeboSimSystem" type="system">
+    <hardware>
+      <plugin>gz_ros2_control/GazeboSimSystem</plugin> <!-- 这里必须使用新版名称 -->
+    </hardware>
+    <joint name="base_to_Rturn">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="Rturn_to_Rthigh">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="Rthigh_to_Rleg">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="Rleg_to_Rfoot">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <!-- Left leg joints -->
+    <joint name="base_to_Lturn">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="Lturn_to_Lthigh">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="Lthigh_to_Lleg">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="Lleg_to_Lfoot">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+  </ros2_control>
+
+  <!-- ==================== GAZEBO SIM PHYSICS ==================== -->
+  <!-- 只需要保留 selfCollision 和接触参数（可选），gz_ros2_control 会忽略 kp/kd 等，但保留无害 -->
+
+  <gazebo reference="base_link">
+    <selfCollision>true</selfCollision>
+  </gazebo>
+  <gazebo reference="top_mount">
+    <selfCollision>true</selfCollision>
+  </gazebo>
+  <gazebo reference="R_turn">
+    <selfCollision>true</selfCollision>
+  </gazebo>
+  <gazebo reference="Rthigh">
+    <selfCollision>true</selfCollision>
+    <!-- IMU: 0.10 m below Rturn_to_Rthigh joint center in base_link Z. -->
+    <sensor name="imu_rthigh" type="imu">
+      <pose>0.013170806 -0.099125908 -0.000764350 0 0 0</pose>
+      <always_on>true</always_on>
+      <update_rate>200</update_rate>
+      <visualize>true</visualize>
+      <topic>/my_exoskeleton/imu/rthigh</topic>
+      <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    </sensor>
+  </gazebo>
+  <gazebo reference="Rleg">
+    <selfCollision>true</selfCollision>
+    <!-- IMU: 0.10 m below Rthigh_to_Rleg joint center in base_link Z. -->
+    <sensor name="imu_rleg" type="imu">
+      <pose>0.000615634 -0.099998105 0.000001731 0 0 0</pose>
+      <always_on>true</always_on>
+      <update_rate>200</update_rate>
+      <visualize>true</visualize>
+      <topic>/my_exoskeleton/imu/rleg</topic>
+      <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    </sensor>
+  </gazebo>
+  <gazebo reference="Rfoot">
+    <selfCollision>true</selfCollision>
+    <max_contacts>10</max_contacts><min_depth>0.001</min_depth>
+    <!-- One ContactSensor; contact points are binned into a 10x6 pressure grid. -->
+    <sensor name="right_foot_contact_sensor" type="contact">
+      <always_on>true</always_on>
+      <update_rate>20</update_rate>
+      <visualize>false</visualize>
+      <contact>
+        <collision>Rfoot_collision</collision>
+        <topic>/right_foot_contact</topic>
+      </contact>
+    </sensor>
+    <!-- IMU: 0.05 m above Rleg_to_Rfoot joint center in base_link Z. -->
+    <sensor name="imu_rfoot" type="imu">
+      <pose>0.000000134 0.050000000 -0.000000178 0 0 0</pose>
+      <always_on>true</always_on>
+      <update_rate>200</update_rate>
+      <visualize>true</visualize>
+      <topic>/my_exoskeleton/imu/rfoot</topic>
+      <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    </sensor>
+  </gazebo>
+  <gazebo reference="Lturn">
+    <selfCollision>true</selfCollision>
+  </gazebo>
+  <gazebo reference="Lthigh">
+    <selfCollision>true</selfCollision>
+    <!-- IMU: 0.10 m below Lturn_to_Lthigh joint center in base_link Z. -->
+    <sensor name="imu_lthigh" type="imu">
+      <pose>0.005099381 0.099864528 -0.001035550 0 0 0</pose>
+      <always_on>true</always_on>
+      <update_rate>200</update_rate>
+      <visualize>true</visualize>
+      <topic>/my_exoskeleton/imu/lthigh</topic>
+      <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    </sensor>
+  </gazebo>
+  <gazebo reference="Lleg">
+    <selfCollision>true</selfCollision>
+    <!-- IMU: 0.10 m below Lthigh_to_Lleg joint center in base_link Z. -->
+    <sensor name="imu_lleg" type="imu">
+      <pose>0.002913621 0.099954823 -0.000737701 0 0 0</pose>
+      <always_on>true</always_on>
+      <update_rate>200</update_rate>
+      <visualize>true</visualize>
+      <topic>/my_exoskeleton/imu/lleg</topic>
+      <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    </sensor>
+  </gazebo>
+  <gazebo reference="Lfoot">
+    <selfCollision>true</selfCollision>
+    <max_contacts>10</max_contacts><min_depth>0.001</min_depth>
+    <!-- One ContactSensor; contact points are binned into a 10x6 pressure grid. -->
+    <sensor name="left_foot_contact_sensor" type="contact">
+      <always_on>true</always_on>
+      <update_rate>20</update_rate>
+      <visualize>false</visualize>
+      <contact>
+        <collision>Lfoot_collision</collision>
+        <topic>/left_foot_contact</topic>
+      </contact>
+    </sensor>
+    <!-- IMU: 0.05 m above Lleg_to_Lfoot joint center in base_link Z. -->
+    <sensor name="imu_lfoot" type="imu">
+      <pose>-0.000000382 -0.049981916 -0.001344632 0 0 0</pose>
+      <always_on>true</always_on>
+      <update_rate>200</update_rate>
+      <visualize>true</visualize>
+      <topic>/my_exoskeleton/imu/lfoot</topic>
+      <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    </sensor>
+  </gazebo>
+
+  <!-- ==================== GAZEBO SIM PHYSICS ==================== -->
+  ...
+  <!-- ign_ros2_control plugin (Gazebo Fortress) -->
+<!-- gz_ros2_control plugin (Gazebo Fortress) -->
+  <gazebo>
+    <plugin filename="libgz_ros2_control-system.so" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+      <robotParam>robot_description</robotParam>
+      <parameters>/home/black_paper/my_exoskeleton/install/my_exoskeleton/share/my_exoskeleton/config/controllers.yaml</parameters>
+    </plugin>
+  </gazebo>
+
+</robot>

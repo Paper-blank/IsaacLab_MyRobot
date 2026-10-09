@@ -1,0 +1,32 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+"""Package containing asset and sensor configurations."""
+
+import importlib.metadata
+import os
+from pathlib import Path
+
+ISAACLAB_ASSETS_EXT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
+"""Path to the extension source directory."""
+
+ISAACLAB_ASSETS_DATA_DIR = os.path.join(ISAACLAB_ASSETS_EXT_DIR, "data")
+"""Path to the extension data directory."""
+
+# Keep custom task/config modules located at the extension root importable in a
+# source checkout (the location requested by the project layout). Installed
+# wheels should package these modules under ``isaaclab_assets`` as usual.
+_extension_root = str(Path(ISAACLAB_ASSETS_EXT_DIR))
+if _extension_root not in __path__:
+    __path__.append(_extension_root)
+
+
+try:
+    __version__ = importlib.metadata.version("isaaclab_assets")
+except importlib.metadata.PackageNotFoundError:
+    __version__ = "0.0.0"
+
+from isaaclab.utils.module import lazy_export
+
+lazy_export()

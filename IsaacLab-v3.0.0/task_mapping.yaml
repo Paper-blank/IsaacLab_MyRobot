@@ -1,0 +1,33 @@
+version: 1
+description: Human-exoskeleton recording task identifiers.
+tasks:
+  BT01:
+    name: "静态站立标定"
+    category: basic
+  BT02:
+    name: "自然行走"
+    category: basic
+  BT03:
+    name: "慢速行走"
+    category: basic
+  BT04:
+    name: "快速行走"
+    category: basic
+  BT05:
+    name: "起步—行走—停止"
+    category: basic
+  AT01:
+    name: "转身"
+    category: advanced
+  AT02:
+    name: "障碍跨越"
+    category: advanced
+  AT03:
+    name: "斜坡行走"
+    category: advanced
+  AT04:
+    name: "台阶行走"
+    category: advanced
+  AT05:
+    name: "手提重物行走"
+    category: advanced

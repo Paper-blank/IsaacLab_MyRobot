@@ -1,0 +1,228 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+name: 'Run Tests in Docker Container'
+description: 'Runs pytest tests in a Docker container with GPU support and result collection'
+
+inputs:
+  test-path:
+    description: 'Path to test directory or pytest arguments'
+    required: true
+  result-file:
+    description: 'Name of the result XML file'
+    required: true
+  container-name:
+    description: 'Name for the Docker container'
+    required: true
+  image-tag:
+    description: 'Docker image tag to use'
+    required: true
+  reports-dir:
+    description: 'Directory to store test results'
+    default: 'reports'
+    required: false
+  pytest-options:
+    description: 'Additional pytest options (e.g., -k filter)'
+    default: ''
+    required: false
+  filter-pattern:
+    description: >-
+      Pattern to filter test files (e.g., isaaclab_tasks); test files whose path
+      contains this pattern are included. Only one pattern can be used at a time,
+      no comma-separated substrings allowed. Also supports the legacy "not <pattern>"
+      form for exclude-only jobs.
+    default: ''
+    required: false
+  exclude-pattern:
+    description: >-
+      Comma-separated substrings; test files whose path contains any entry are
+      excluded. Combines with filter-pattern (include + exclude).
+    default: ''
+    required: false
+  test-k-expr:
+    description: >-
+      Global pytest -k expression applied inside every per-file pytest run
+      spawned by tools/conftest.py (combined with device-split selectors).
+      Unlike pytest-options, this reaches the individual test processes, so it
+      can deselect parametrized cases (e.g. "not ovphysx").
+    default: ''
+    required: false
+  curobo-only:
+    description: 'Run only cuRobo and SkillGen tests (requires the cuRobo Docker image)'
+    default: 'false'
+    required: false
+  quarantined-only:
+    description: 'Run only tests listed in QUARANTINED_TESTS (skipped in normal jobs)'
+    default: 'false'
+    required: false
+  include-files:
+    description: 'Comma-separated list of specific test file paths to include (e.g., source/pkg/test/test_a.py,source/pkg/test/test_b.py)'
+    default: ''
+    required: false
+  test-node-ids-file:
+    description: 'TOML file containing exact pytest node IDs to run'
+    default: ''
+    required: false
+  test-node-ids-key:
+    description: 'Top-level key in test-node-ids-file containing the node IDs for this job'
+    default: ''
+    required: false
+  shard-index:
+    description: 'Zero-based index of this shard (used with shard-count to split tests across parallel jobs)'
+    default: ''
+    required: false
+  shard-count:
+    description: 'Total number of shards (used with shard-index to split tests across parallel jobs)'
+    default: ''
+    required: false
+  volume-mount-source:
+    description: 'Host path to bind-mount at /workspace/isaaclab (for deps-cache-hit mode)'
+    default: ''
+    required: false
+  extra-pip-packages:
+    description: 'Space-separated pip packages to install inside the Docker container before pytest starts'
+    default: ''
+    required: false
+  extra-uv-packages:
+    description: 'Space-separated packages to install with uv inside the Docker container before pytest starts'
+    default: ''
+    required: false
+  wheelhouse-host-dir:
+    description: 'Host directory containing wheelhouse/ and manifest.json for offline pip installs'
+    default: ''
+    required: false
+  wheelhouse-packages:
+    description: 'Space-separated packages to install from /tmp/ovphysx-wheelhouse with pip --no-index'
+    default: ''
+  warp-cache-host-dir:
+    description: 'Host Warp kernel cache directory bind-mounted into the container as WARP_CACHE_PATH'
+    default: ''
+    required: false
+  ovrtx-shader-cache-host-dir:
+    description: >-
+      Host OVRTX shader cache root. When set, its kit/ and kitless/ trees are
+      bind-mounted into the container; run_tests.sh owns the mount layout.
+    default: ''
+    required: false
+  ci-marker:
+    description: 'CI_MARKER value forwarded to the container (read by tools/conftest.py to select test files by pytest marker)'
+    default: ''
+    required: false
+  standalone-script-scope:
+    description: 'Enable standalone script smoke tests for this scripts/ subdirectory'
+    default: ''
+    required: false
+  standalone-script-visualizer:
+    description: 'Visualizer slice used when standalone-script-scope is set'
+    default: 'none'
+    required: false
+  standalone-script-runtime-group:
+    description: 'Run Kit-dependent or non-Kit standalone script cases'
+    default: ''
+    required: false
+  omni-github-test-type:
+    description: 'Test type stored on each uploaded omni-github test row'
+    default: 'pytest'
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Run Tests in Docker Container
+      shell: bash
+      env:
+        # Passed via env instead of inline ${{ }} interpolation: pytest options may
+        # contain spaces and quotes (e.g. -k "not ovphysx"), which would word-split
+        # the run_tests positional arguments if substituted textually.
+        PYTEST_OPTIONS: ${{ inputs.pytest-options }}
+        TEST_K_EXPR_INPUT: ${{ inputs.test-k-expr }}
+        CI_MARKER_INPUT: ${{ inputs.ci-marker }}
+      run: |
+        bash .github/actions/run-tests/run_tests.sh "${{ inputs.test-path }}" "${{ inputs.result-file }}" "${{ inputs.container-name }}" "${{ inputs.image-tag }}" "${{ inputs.reports-dir }}" "$PYTEST_OPTIONS" "${{ inputs.filter-pattern }}" "${{ inputs.exclude-pattern }}" "${{ inputs.curobo-only }}" "${{ inputs.include-files }}" "${{ inputs.quarantined-only }}" "${{ inputs.shard-index }}" "${{ inputs.shard-count }}" "${{ inputs.volume-mount-source }}" "${{ inputs.extra-pip-packages }}" "${{ inputs.test-node-ids-file }}" "${{ inputs.test-node-ids-key }}" "${{ inputs.wheelhouse-host-dir }}" "${{ inputs.wheelhouse-packages }}" "$TEST_K_EXPR_INPUT" "$CI_MARKER_INPUT" "${{ inputs.standalone-script-scope }}" "${{ inputs.standalone-script-visualizer }}" "${{ inputs.standalone-script-runtime-group }}" "${{ inputs.warp-cache-host-dir }}" "${{ inputs.extra-uv-packages }}" "${{ inputs.ovrtx-shader-cache-host-dir }}"
+    - name: Kill container on cancellation
+      if: cancelled()
+      shell: bash
+      run: |
+        echo "::warning::Job cancelled - force-killing container"
+        docker kill "${{ inputs.container-name }}" 2>/dev/null || true
+        docker rm -f "${{ inputs.container-name }}" 2>/dev/null || true
+
+    - name: Write job summary
+      if: always()
+      shell: bash
+      run: |
+        report="${{ inputs.reports-dir }}/${{ inputs.result-file }}"
+        if [ ! -f "$report" ]; then
+          echo "🟠 No test report found" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # Parse JUnit XML and produce a markdown summary.
+        # Exit code 2 means the report was corrupt/unreadable - surface the
+        # error in the summary but don't mask the real test exit code.
+        if ! python3 .github/actions/run-tests/junit_summary.py "$report" >> "$GITHUB_STEP_SUMMARY"; then
+          echo "::warning::junit_summary.py failed to parse $report - test results may be missing from the summary"
+        fi
+
+    - name: Upload comparison images
+      if: always()
+      id : upload-comparison-images
+      uses: actions/upload-artifact@v7
+      with:
+        name: comparison-images-${{ inputs.container-name }}
+        path: ${{ inputs.reports-dir }}/comparison-images/
+        if-no-files-found: ignore
+        retention-days: 7
+
+    # Renderer logs are quoted into the reports only as a bounded tail; the full log per test is here.
+    - name: Upload OVRTX renderer logs
+      if: always()
+      id: upload-ovrtx-logs
+      uses: actions/upload-artifact@v7
+      with:
+        name: ovrtx-logs-${{ inputs.container-name }}
+        path: ${{ inputs.reports-dir }}/ovrtx-logs/
+        if-no-files-found: ignore
+        retention-days: 7
+        compression-level: 9
+
+    # The reports carry the dump truncated to 10 000 chars; the whole thing per test file is here.
+    - name: Upload hang stack dumps
+      if: always()
+      id: upload-hang-dumps
+      uses: actions/upload-artifact@v7
+      with:
+        name: hang-dumps-${{ inputs.container-name }}
+        path: ${{ inputs.reports-dir }}/hang-dumps/
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Upload JUnit XML report
+      if: always()
+      id: upload-junit-report
+      uses: actions/upload-artifact@v7
+      with:
+        name: junit-${{ inputs.container-name }}
+        path: ${{ inputs.reports-dir }}/${{ inputs.result-file }}
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Upload omni-github test results
+      if: always()
+      uses: ./.github/actions/upload-omni-github-test-results
+      with:
+        junit-file: ${{ inputs.reports-dir }}/${{ inputs.result-file }}
+        junit-log-url: ${{ steps.upload-junit-report.outputs.artifact-url }}
+        comparison-images-url: ${{ steps.upload-comparison-images.outputs.artifact-url }}
+        artifact-prefix: pytest-results-${{ github.job }}-${{ inputs.container-name }}
+        test-type: ${{ inputs.omni-github-test-type }}
+
+    - name: Clean up Docker container
+      if: always() && !cancelled()
+      shell: bash
+      run: |
+        echo "🔵 Cleaning up Docker container..."
+        docker kill "${{ inputs.container-name }}" 2>/dev/null || true
+        docker rm -f "${{ inputs.container-name }}" 2>/dev/null || true

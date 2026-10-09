@@ -1,0 +1,23 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+    use_sim_time: true
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    exoskeleton_position_controller:
+      type: position_controllers/JointGroupPositionController
+
+exoskeleton_position_controller:
+  ros__parameters:
+    joints:
+      - base_to_Rturn
+      - Rturn_to_Rthigh
+      - Rthigh_to_Rleg
+      - Rleg_to_Rfoot
+      - base_to_Lturn
+      - Lturn_to_Lthigh
+      - Lthigh_to_Lleg
+      - Lleg_to_Lfoot
+    interface_name: position

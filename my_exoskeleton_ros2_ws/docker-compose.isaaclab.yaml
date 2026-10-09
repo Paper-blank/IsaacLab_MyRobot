@@ -1,0 +1,6 @@
+services:
+  isaac-lab-ros2:
+    volumes:
+      - type: bind
+        source: /home/lqf/MyCode/my_exoskeleton_ros2_ws
+        target: /workspace/ros2_ws

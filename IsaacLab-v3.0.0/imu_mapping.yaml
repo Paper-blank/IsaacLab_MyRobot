@@ -1,0 +1,34 @@
+version: 1
+description: Six retained IMUs in recorder order (ankle 01/02, knee 03/04, hip 05/06).
+imu_mapping:
+  imu_01:
+    sensor_id: 1
+    robot_link: left_foot
+    role: "左足踝外侧"
+    aliases: [Lfoot, l_foot, foot_left, ankle_left, left_ankle]
+  imu_02:
+    sensor_id: 2
+    robot_link: right_foot
+    role: "右足踝外侧"
+    aliases: [Rfoot, r_foot, foot_right, ankle_right, right_ankle]
+  imu_03:
+    sensor_id: 3
+    robot_link: left_shank
+    role: "左膝关节/小腿近端"
+    aliases: [Lleg, l_leg, left_leg, left_shin, shank_left, knee_left, left_knee]
+  imu_04:
+    sensor_id: 4
+    robot_link: right_shank
+    role: "右膝关节/小腿近端"
+    aliases: [Rleg, r_leg, right_leg, right_shin, shank_right, knee_right, right_knee]
+  imu_05:
+    sensor_id: 5
+    robot_link: left_thigh
+    role: "左髋关节/大腿近端"
+    aliases: [Lthigh, l_thigh, thigh_left, hip_left, left_hip]
+  imu_06:
+    sensor_id: 6
+    robot_link: right_thigh
+    role: "右髋关节/大腿近端"
+    aliases: [Rthigh, r_thigh, thigh_right, hip_right, right_hip]
+ignored_imus: [imu_07, imu_08, imu_09, imu_10, imu_11]

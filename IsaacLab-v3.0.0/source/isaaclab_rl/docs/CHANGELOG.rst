@@ -1,0 +1,562 @@
+Changelog
+---------
+
+0.16.0 (2026-08-18)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added backend-aware pretrained checkpoint discovery using
+  ``<task_name>_<physics_backend>_<render_backend>_<rl_library>`` filenames,
+  with ``newtonmjwarp`` identifying the Newton MJWarp physics backend.
+* Added preferred core-task checkpoint training and local collection by RL
+  library.
+
+Changed
+^^^^^^^
+
+* Changed new pretrained checkpoint uploads to use one flat directory per RL
+  library. Legacy callers that do not provide backend names continue to use the
+  previous ``<library>/<task>/checkpoint`` layout.
+
+Fixed
+^^^^^
+
+* Fixed legacy checkpoint log discovery to preserve task-specific experiment
+  directories.
+* Fixed LEAPP export scripts to select pretrained checkpoints for the resolved
+  physics and rendering backends.
+* Fixed checkpoint documentation and CLI help to describe the ``pretrained``
+  selector, automatic local discovery, and published-asset availability.
+
+
+0.15.0 (2026-08-14)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Enabled ``--video`` recording with ``--viz newton_rtx``.
+
+Changed
+^^^^^^^
+
+* **Breaking:** Unified checkpoint loading on ``--checkpoint``. Removed RSL-RL ``--load_run`` and ``--resume``, and RLinf ``--rl_model_path``, ``--resume_dir``, and ``--max_epochs``.
+* **Breaking:** Changed the ``train`` and ``play`` CLI commands to use a task's
+  registered default RL library when ``--rl_library`` is omitted. Pass
+  ``--rl_library`` explicitly to select a different library.
+
+
+0.14.1 (2026-08-12)
+~~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed the train and play startup summary reporting ``physics=physx`` and ``renderer=rtx`` by the
+  name the command line asked for. Both name a backend family that is resolved at launch, so the
+  summary now names the backend the run will actually use next to the family it was asked for --
+  ``rtx (ovrtx)`` for a kitless ``physics=ovphysx renderer=rtx`` run and ``rtx (isaacsim_rtx)``
+  when the run needs Kit.
+* Fixed the summary of a ``--video`` training run reporting no visualizer, which happened because
+  the recording visualizer was injected after the summary was printed.
+
+
+0.14.0 (2026-08-08)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added a startup loading screen to the ``train`` and ``play`` entrypoints. Each run now prints a
+  summary of its task, workflow, RL library, physics, renderer, presets, visualizer, device, and
+  environment count, followed by a progress bar that hands the console back before training starts.
+  The presets row lists any other presets the run selected, such as ``presets=cube``, and reads
+  ``none`` when it selected none.
+* Added :func:`~isaaclab_rl.entrypoints.run_train_multigpu_cli`, which moves the multi-GPU launcher
+  into the package alongside the train and play entry points.
+  ``scripts/reinforcement_learning/train_multigpu.py`` is now a shim over it.
+
+Changed
+^^^^^^^
+
+* Updated all play entrypoints (``play_rsl_rl``, ``play_sb3``, ``play_skrl``,
+  ``play_rl_games``) to use :func:`~isaaclab_rl.entrypoints.common.create_isaaclab_env`
+  instead of bare ``gym.make``, restoring warp frontend support and MARL-to-single-agent
+  conversion at play time (parity with the train entrypoints).
+
+* Replaced the ``gym.wrappers.RecordVideo`` wrapper approach with
+  :func:`~isaaclab_rl.entrypoints.common.apply_video_recording`, which injects a
+  :class:`~isaaclab.envs.utils.video_recorder_cfg.VideoRecorderCfg` into the env config
+  before creation so recording is driven inside ``env.step()`` rather than via a wrapper.
+
+Fixed
+^^^^^
+
+* Fixed the multi-GPU launcher leaving worker processes behind on Ctrl-C. It ran torchrun in its own
+  process group, so the terminal signalled torchrun and every worker at the same moment the launcher
+  forwarded a signal of its own, and the extra signal interrupted torchelastic's shutdown before it
+  had reaped the workers. The launcher now starts the worker tree in a new session, forwards one
+  signal to it, and escalates to ``SIGTERM`` and then ``SIGKILL`` so a worker wedged in a native call
+  cannot outlive the run.
+
+
+0.13.0 (2026-08-05)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added :attr:`~isaaclab_rl.rsl_rl.RslRlBaseRunnerCfg.init_at_random_ep_len`
+  for configuring initial episode-length randomization.
+
+Changed
+^^^^^^^
+
+* Updated all play entrypoints (``play_rsl_rl``, ``play_sb3``, ``play_skrl``,
+  ``play_rl_games``) to use :func:`~isaaclab_rl.entrypoints.common.create_isaaclab_env`
+  instead of bare ``gym.make``, restoring warp frontend support and MARL-to-single-agent
+  conversion at play time (parity with the train entrypoints).
+
+* Replaced the ``gym.wrappers.RecordVideo`` wrapper approach with
+  :func:`~isaaclab_rl.entrypoints.common.apply_video_recording`, which injects a
+  :class:`~isaaclab.envs.utils.video_recorder_cfg.VideoRecorderCfg` into the env config
+  before creation so recording is driven inside ``env.step()`` rather than via a wrapper.
+
+
+0.12.0 (2026-08-01)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added LEAPP policy export support for RL-Games, skrl, and
+  Stable-Baselines3.
+* Added the ``leapp`` optional dependency group for uv-based export and
+  deployment workflows.
+
+
+0.11.0 (2026-07-31)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added the checkpoint-free playback workflows :func:`~isaaclab_rl.zero_agent` and
+  :func:`~isaaclab_rl.random_agent`, their :class:`~isaaclab_rl.SimpleAgentRequest`
+  parameters, and the :func:`~isaaclab_rl.run_zero_agent_cli` and
+  :func:`~isaaclab_rl.run_random_agent_cli` command-line dispatchers.
+* Added a ``--max_steps`` argument to the zero and random agents, bounding the number of
+  environment steps to run. The agents run unbounded when it is omitted.
+
+Changed
+^^^^^^^
+
+* Changed ``scripts/environments/zero_agent.py`` and ``scripts/environments/random_agent.py``
+  to thin delegates of the reusable entrypoints in :mod:`isaaclab_rl.entrypoints`. Their
+  command-line interface is unchanged.
+
+
+0.10.1 (2026-07-30)
+~~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed reusable reinforcement learning entrypoints to restore caller Torch and
+  SKRL backend settings after in-process training and playback.
+
+
+0.10.0 (2026-07-29)
+~~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Changed :meth:`~isaaclab_rl.rsl_rl.RslRlVecEnvWrapper.get_observations` to read the
+  environment-owned observation buffer instead of private environment methods. The
+  returned observations now match the latest reset/step returns, including observation
+  noise.
+
+
+0.9.0 (2026-07-25)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added ``--frontend {torch,warp}`` to the shared reinforcement-learning
+  training and play CLIs (all supported RL libraries) for selecting the
+  environment runtime; default ``torch`` is unchanged. The ``rlinf``
+  integration constructs environments inside the external framework and is
+  not frontend-routable.
+
+
+0.8.0 (2026-07-24)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added reusable unified training and playback entrypoints under :mod:`isaaclab_rl`, including the
+  :class:`~isaaclab_rl.TrainingRequest` and :class:`~isaaclab_rl.PlaybackRequest` programmatic APIs
+  and the :func:`~isaaclab_rl.train`, :func:`~isaaclab_rl.play`, :func:`~isaaclab_rl.run_train_cli`,
+  and :func:`~isaaclab_rl.run_play_cli` functions.
+* Added a ``--train_env_cfg`` flag to the play entrypoints that plays the training environment
+  configuration as-is, skipping the play-mode overrides defined by the environment configuration's
+  ``play_mode`` method.
+* Added :func:`~isaaclab_rl.entrypoints.common.resolve_play_task_name` that redirects a retired
+  ``-Play`` task id to its training task id with a deprecation warning.
+* Added agent-aware task help to the unified RL-Games, RSL-RL, skrl, and
+  Stable-Baselines3 training and playback commands.
+
+Changed
+^^^^^^^
+
+* Changed RL Games population-based training launches to stop forwarding the deprecated
+  ``--headless`` and ``--enable_cameras`` arguments. Configure visualization through the
+  selected visualizer instead.
+
+Removed
+^^^^^^^
+
+* Removed ``config/extension.toml`` Kit extension manifest. Inter-package dependencies are now
+  declared via PEP 508 ``file:`` references in ``[project.dependencies]`` of ``pyproject.toml``,
+  ensuring standalone pip installs resolve local checkouts without a package index.
+* Removed the deprecated per-library scripts under ``scripts/reinforcement_learning/<library>/``
+  (``train.py``, ``play.py``, and ``cli_args.py``). Use the unified
+  ``scripts/reinforcement_learning/train.py`` and ``play.py`` executables with
+  ``--rl_library <library>``, or the programmatic :func:`~isaaclab_rl.train` and
+  :func:`~isaaclab_rl.play` APIs instead.
+* Removed the ``--use_last_checkpoint`` flag from the RL-Games ``play`` entrypoint.
+  Use ``--checkpoint latest`` to select the newest checkpoint instead.
+
+Fixed
+^^^^^
+
+* Fixed the ``--deterministic`` flag not configuring PyTorch deterministic operations in the RL-Games,
+  RSL-RL, Stable-Baselines3, and skrl backends of the unified ``train`` and ``play`` entrypoints.
+
+
+0.7.0 (2026-07-03)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Bumped the ``rsl-rl-lib`` dependency to ``5.4.1``, which natively supports image-only policies
+  (observation sets with no 1D groups).
+* Changed :attr:`~isaaclab_rl.rsl_rl.RslRlCNNModelCfg.class_name` to default to rsl-rl's
+  ``CNNModel`` now that it supports image-only observations out of the box.
+
+Removed
+^^^^^^^
+
+* Removed the Isaac Lab ``CNNModel`` override of rsl-rl's ``CNNModel`` that previously added
+  image-only observation support. Use rsl-rl's ``CNNModel`` (the new default of
+  :attr:`~isaaclab_rl.rsl_rl.RslRlCNNModelCfg.class_name`) instead.
+
+
+0.6.2 (2026-06-28)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Updated ``Sb3VecEnvWrapper`` to use Isaac Lab Same-Step ``extras["final_obs"]``
+  as SB3 ``terminal_observation`` when it is available.
+
+
+0.6.1 (2026-06-09)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed :func:`~isaaclab_rl.skrl.SkrlVecEnvWrapper` failing to import the JAX wrapper on recent JAX
+  versions by preloading the ``jax.experimental.multihost_utils`` submodule that skrl's distributed
+  models reference without importing.
+* Fixed LEAPP export of RSL-RL recurrent policies to preserve actor hidden
+  state across supported RSL-RL policy APIs.
+
+
+0.6.0 (2026-06-04)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added :class:`~isaaclab_rl.rsl_rl.models.CNNModel`, a drop-in extension of rsl-rl's ``CNNModel`` that
+  also supports image-only policies (observation sets with no 1D groups). rsl-rl's model raises
+  ``ValueError: torch.cat(): expected a non-empty list of Tensors`` in that case.
+
+Changed
+^^^^^^^
+
+* Changed :attr:`~isaaclab_rl.rsl_rl.RslRlCNNModelCfg.class_name` to default to
+  :class:`~isaaclab_rl.rsl_rl.models.CNNModel` so CNN policies support image-only observations out of
+  the box. The new model is identical to rsl-rl's ``CNNModel`` when 1D observation groups are present;
+  set ``class_name="CNNModel"`` to restore the previous behavior.
+
+
+0.5.3 (2026-06-02)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Normalized extra names to their PEP 685 canonical hyphenated forms. The
+  underscore aliases ``rsl_rl`` and ``rl_games`` are removed; use
+  ``rsl-rl`` and ``rl-games`` instead (e.g.
+  ``pip install isaaclab-rl[rsl-rl]``).
+* Changed the ``skrl`` optional dependency floor to ``2.1.0`` for
+  compatibility with ``warp-lang`` 1.13.
+
+
+0.5.2 (2026-05-08)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added RSL-RL LEAPP export scripts and integration tests for exporting trained
+  policies with semantic input, output, and state annotations.
+
+
+0.5.1 (2026-04-21)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Locked h5py dependency to last stable version 3.15.1 to prevent package import errors on Windows with version 3.16.0.
+* Updated skrl wrapper to support the new version of skrl 2.0.
+
+
+0.5.0 (2026-3-04)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+* Added function to handle deprecated RSL-RL configurations and automatically convert them to the new format compatible
+  with RSL-RL 4.0 and 5.0.
+* Added new configuration classes "MLPModelCfg", "RNNModelCfg", and "CNNModelCfg", and "DistributionCfg" for the new
+  versions of RSL-RL.
+* Added "check_for_nan" and "share_cnn_encoders" parameters to the configuration classes for RSL-RL 5.0.
+* Added recurrent configurations for the "Isaac-Velocity-Flat-Anymal-D-v0" task for RSL-RL. to run RSL-RL CI.
+
+Changed
+^^^^^^^
+* Adapted RSL-RL's train.py and play.py scripts to work with both old and the new versions of RSL-RL.
+
+Deprecated
+^^^^^^^^^^
+* Deprecated old configuration classes "RslRlDistillationStudentTeacherCfg",
+  "RslRlDistillationStudentTeacherRecurrentCfg", "RslRlPpoActorCriticCfg", and "RslRlPpoActorCriticRecurrentCfg" in
+  favor of the new "MLPModelCfg", "RNNModelCfg", and "CNNModelCfg" configuration classes for RSL-RL 4.0.
+* Deprecated old parameters "stochastic", "init_noise_std", "noise_std_type", amd "state_dependent_std" in favor of the
+  new "DistributionCfg" configuration class for RSL-RL 5.0.
+
+
+0.4.7 (2025-12-29)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Added :mod:`isaaclab_rl.utils.pretrained_checkpoint` sub-module to handle various pre-trained checkpoint tasks.
+  This module was previously located in the :mod:`isaaclab.utils` module.
+
+
+0.4.6 (2025-11-10)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Added support for decoupling RL device from simulation device in for RL games wrapper.
+  This allows users to run simulation on one device (e.g., CPU) while running RL training/inference on another device.
+
+
+0.4.5 (2025-12-01)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added state_dependent_std rsl_rl param to RSL-RL wrapper.
+
+
+0.4.4 (2025-10-15)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Added onnxscript package to isaaclab_rl setup.py to fix onnxscript package missing issue in aarch64 platform.
+
+
+0.4.3 (2025-10-15)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Isaac-Ant-v0's sb3_ppo_cfg default value, so it trains under reasonable amount of time.
+
+
+0.4.2 (2025-10-14)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Updated opset version from 11 to 18 in RSL-RL OnnxPolicyExporter to avoid onnex downcast issue seen in aarch64.
+
+
+0.4.1 (2025-09-09)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Made PBT a bit nicer by
+* 1. added resume logic to allow wandb to continue on the same run_id
+* 2. corrected broadcasting order in distributed setup
+* 3. made score query general by using dotted keys to access dictionary of arbitrary depth
+
+
+0.4.0 (2025-09-09)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Introduced PBT to rl-games.
+
+
+0.3.0 (2025-09-03)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Enhanced rl-games wrapper to allow dict observation.
+
+
+0.2.4 (2025-08-07)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Disallowed string values in ``sb3_ppo_cfg.yaml`` from being passed to ``eval()`` in
+  :meth:`~isaaclab_rl.sb3.process_sb3_cfg`. This change prevents accidental or malicious
+  code execution when loading configuration files, improving overall security and reliability.
+
+
+0.2.3 (2025-06-29)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Support SB3 VecEnv wrapper to configure with composite observation spaces properly so that the cnn creation pipelines
+  natively supported by sb3 can be automatically triggered
+
+
+0.2.2 (2025-06-30)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Call :meth:`eval` during :meth:`forward`` RSL-RL OnnxPolicyExporter
+
+
+0.2.1 (2025-06-26)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Relaxed upper range pin for protobuf python dependency for more permissive installation.
+
+
+0.2.0 (2025-04-24)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Switched to a 3.11 compatible branch for rl-games as Isaac Sim 5.0 is now using Python 3.11.
+
+
+0.1.5 (2025-04-11)
+~~~~~~~~~~~~~~~~~~
+
+Changed
+^^^^^^^
+
+* Optimized Stable-Baselines3 wrapper ``Sb3VecEnvWrapper`` (now 4x faster) by using Numpy buffers and only logging episode and truncation information by default.
+* Upgraded minimum SB3 version to 2.6.0 and added optional dependencies for progress bar
+
+
+0.1.4 (2025-04-10)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added configurations for distillation implementation in RSL-RL.
+* Added configuration for recurrent actor-critic in RSL-RL.
+
+
+0.1.3 (2025-03-31)
+~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed the location of :meth:`isaaclab_rl.rsl_rl.RslRlOnPolicyRunnerCfg._modify_action_space`
+  to be called only after retrieving the dimensions of the environment, preventing errors
+  related to accessing uninitialized attributes.
+
+
+0.1.2 (2025-03-28)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added symmetry and curiosity-based exploration configurations for RSL-RL wrapper.
+
+
+0.1.1 (2025-03-10)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added a parameter to clip the actions in the action space inside the RSL-RL wrapper.
+  This parameter is set to None by default, which is the same as not clipping the actions.
+* Added attribute :attr:`isaaclab_rl.rsl_rl.RslRlOnPolicyRunnerCfg.clip_actions` to set
+  the clipping range for the actions in the RSL-RL on-policy runner.
+
+
+0.1.0 (2024-12-27)
+~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+Initial version of the extension.
+This extension is split off from ``isaaclab_tasks`` to include the wrapper scripts for the supported RL libraries.
+
+Supported RL libraries are:
+
+* RL Games
+* RSL RL
+* SKRL
+* Stable Baselines3

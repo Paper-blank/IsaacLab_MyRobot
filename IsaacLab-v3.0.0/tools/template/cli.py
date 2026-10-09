@@ -1,0 +1,309 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+import enum
+import importlib
+import os
+from collections.abc import Callable
+from textwrap import fill
+
+import rich.console
+import rich.table
+from common import ROOT_DIR
+from generator import generate, get_algorithms_per_rl_library
+from rich.prompt import Prompt
+
+_SUPPORTED_WORKFLOWS = ["Manager-based | single-agent", "Direct | single-agent", "Direct | multi-agent"]
+_SINGLE_AGENT_RL_LIBRARIES = ["rsl_rl", "rl_games", "skrl", "sb3"]
+
+
+class CLIHandler:
+    """CLI handler for the Isaac Lab template."""
+
+    def __init__(self, console: rich.console.Console | None = None):
+        self.console = console if console is not None else rich.console.Console()
+
+    @staticmethod
+    def get_choices(choices: list[str], default: list[str]) -> list[str]:
+        return default if "all" in choices or "both" in choices else choices
+
+    def output_table(self, table: rich.table.Table, new_line_start: bool = True) -> None:
+        """Print a rich table to the console.
+
+        Args:
+            table: The table to print.
+            new_line_start: Whether to print a new line before the table.
+        """
+        self.console.print(table, new_line_start=new_line_start)
+
+    def input_select(
+        self, message: str, choices: list[str], default: str | None = None, long_instruction: str = ""
+    ) -> str:
+        """Prompt the user to select an option from a list of choices.
+
+        Args:
+            message: The message to display to the user.
+            choices: The list of choices to display to the user.
+            default: The default choice.
+            long_instruction: The long instruction to display to the user.
+
+        Returns:
+            str: The selected choice.
+        """
+        if long_instruction:
+            self.console.print(long_instruction, markup=False)
+        return self._ask(message, choices=choices, default=default)
+
+    def input_checkbox(self, message: str, choices: list[str], default: str | None = None) -> list[str]:
+        """Prompt the user to select one or more options from a list of choices.
+
+        Args:
+            message: The message to display to the user.
+            choices: The list of choices to display to the user.
+            default: The default choice.
+
+        Returns:
+            The selected choices.
+        """
+
+        selectable_choices = [choice for choice in choices if choice != "---"]
+        for index, choice in enumerate(selectable_choices, start=1):
+            self.console.print(f"  [cyan]{index}[/cyan].", choice)
+
+        default_index = None
+        if default is not None and default in selectable_choices:
+            default_index = str(selectable_choices.index(default) + 1)
+
+        while True:
+            response = self._ask(
+                f"{message} Enter comma-separated numbers",
+                default=default_index,
+            )
+            try:
+                indices = [int(token.strip()) for token in response.split(",")]
+            except ValueError:
+                indices = []
+            if indices and all(1 <= index <= len(selectable_choices) for index in indices):
+                return list(dict.fromkeys(selectable_choices[index - 1] for index in indices))
+            self.console.print("Enter one or more valid numbers separated by commas.", style="red")
+
+    def input_path(
+        self,
+        message: str,
+        default: str | None = None,
+        validate: Callable[[str], bool] | None = None,
+        invalid_message: str = "",
+    ) -> str:
+        """Prompt the user to input a path.
+
+        Args:
+            message: The message to display to the user.
+            default: The default path.
+            validate: A callable to validate the path.
+            invalid_message: The message to display to the user if the path is invalid.
+
+        Returns:
+            The input path.
+        """
+        return self._input_value(message, default, validate, invalid_message)
+
+    def input_text(
+        self,
+        message: str,
+        default: str | None = None,
+        validate: Callable[[str], bool] | None = None,
+        invalid_message: str = "",
+    ) -> str:
+        """Prompt the user to input a text.
+
+        Args:
+            message: The message to display to the user.
+            default: The default text.
+            validate: A callable to validate the text.
+            invalid_message: The message to display to the user if the text is invalid.
+
+        Returns:
+            The input text.
+        """
+        return self._input_value(message, default, validate, invalid_message)
+
+    def _ask(
+        self,
+        message: str,
+        choices: list[str] | None = None,
+        default: str | None = None,
+    ) -> str:
+        """Prompt for a string with optional choices and default value."""
+        kwargs = {"console": self.console, "choices": choices, "case_sensitive": False}
+        if default is not None:
+            kwargs["default"] = default
+        return Prompt.ask(message.removesuffix(":"), **kwargs)
+
+    def _input_value(
+        self,
+        message: str,
+        default: str | None,
+        validate: Callable[[str], bool] | None,
+        invalid_message: str,
+    ) -> str:
+        """Prompt until the entered value passes validation."""
+        while True:
+            value = self._ask(message, default=default)
+            if validate is None or validate(value):
+                return value
+            self.console.print(invalid_message or "Invalid input.", style="red")
+
+
+class State(str, enum.Enum):
+    Yes = "[green]yes[/green]"
+    No = "[red]no[/red]"
+
+
+def main() -> None:
+    """Main function to run template generation from CLI."""
+    cli_handler = CLIHandler()
+
+    lab_module = importlib.import_module("isaaclab")
+    lab_path = os.path.realpath(getattr(lab_module, "__file__", "") or (getattr(lab_module, "__path__", [""])[0]))
+    is_lab_pip_installed = ("site-packages" in lab_path) or ("dist-packages" in lab_path)
+
+    if not is_lab_pip_installed:
+        # project type
+        is_external_project = (
+            cli_handler.input_select(
+                "Task type:",
+                choices=["External", "Internal"],
+                long_instruction=(
+                    "External (recommended): task/project is in its own folder/repo outside the Isaac Lab project.\n"
+                    "Internal: the task is implemented within the Isaac Lab project (in source/isaaclab_tasks)."
+                ),
+            ).lower()
+            == "external"
+        )
+    else:
+        is_external_project = True
+
+    # project path (if 'external')
+    project_path = None
+    if is_external_project:
+        project_path = cli_handler.input_path(
+            "Project path:",
+            default=os.path.dirname(ROOT_DIR) + os.sep,
+            validate=lambda path: not os.path.abspath(path).startswith(os.path.abspath(ROOT_DIR)),
+            invalid_message="External project path cannot be within the Isaac Lab project",
+        )
+
+    # project/task names
+    project_name = cli_handler.input_text(
+        "Project name:" if is_external_project else "Task's folder name:",
+        validate=lambda name: name.isidentifier(),
+        invalid_message=(
+            "Project/task name must be a valid identifier (Letters, numbers and underscores only. No spaces, etc.)"
+        ),
+    )
+    if is_external_project:
+        task_name = cli_handler.input_text(
+            "Task family name:",
+            default="balance",
+            validate=lambda name: name.isidentifier(),
+            invalid_message="Task family name must be a valid Python identifier.",
+        )
+        robot_name = cli_handler.input_text(
+            "Robot/config name:",
+            default="cartpole",
+            validate=lambda name: name.isidentifier(),
+            invalid_message="Robot/config name must be a valid Python identifier.",
+        )
+        include_ui_extension = (
+            cli_handler.input_select(
+                "Include Isaac Sim UI extension:",
+                choices=["No", "Yes"],
+                default="No",
+                long_instruction=(
+                    "Choose Yes only if this project needs an extension loaded through the Isaac Sim Extension Manager."
+                ),
+            ).lower()
+            == "yes"
+        )
+    else:
+        task_name = project_name
+        robot_name = "cartpole"
+        include_ui_extension = False
+
+    # Isaac Lab workflow
+    # - show supported workflows and features
+    workflow_table = rich.table.Table(title="RL environment features support according to Isaac Lab workflows")
+    workflow_table.add_column("Environment feature", no_wrap=True)
+    workflow_table.add_column("Manager-based", justify="center")
+    workflow_table.add_column("Direct", justify="center")
+    workflow_table.add_row("Single-agent", State.Yes, State.Yes)
+    workflow_table.add_row("Multi-agent", State.No, State.Yes)
+    workflow_table.add_row("Fundamental/composite spaces (apart from 'Box')", State.No, State.Yes)
+    cli_handler.output_table(workflow_table)
+    # - prompt for workflows
+    workflow = cli_handler.get_choices(
+        cli_handler.input_checkbox("Isaac Lab workflow:", choices=[*_SUPPORTED_WORKFLOWS, "---", "all"]),
+        default=_SUPPORTED_WORKFLOWS,
+    )
+    workflow = [{"name": item.split(" | ")[0].lower(), "type": item.split(" | ")[1].lower()} for item in workflow]
+    single_agent_workflow = [item for item in workflow if item["type"] == "single-agent"]
+    multi_agent_workflow = [item for item in workflow if item["type"] == "multi-agent"]
+
+    # RL library
+    rl_library_algorithms = []
+    algorithms_per_rl_library = get_algorithms_per_rl_library()
+    # - show supported RL libraries and features
+    rl_library_table = rich.table.Table(title="Supported RL libraries")
+    rl_library_table.add_column("RL/training feature", no_wrap=True)
+    rl_library_table.add_column("rsl_rl", overflow="fold")
+    rl_library_table.add_column("rl_games", overflow="fold")
+    rl_library_table.add_column("skrl", overflow="fold")
+    rl_library_table.add_column("sb3", overflow="fold")
+    rl_library_table.add_row("ML frameworks", "PyTorch", "PyTorch", "PyTorch, JAX", "PyTorch")
+    rl_library_table.add_row("Relative performance", "~1X", "~1X", "~1X", "~0.03X")
+    rl_library_table.add_row(
+        "Algorithms",
+        fill(", ".join(algorithms_per_rl_library.get("rsl_rl", [])), width=12, break_long_words=False),
+        fill(", ".join(algorithms_per_rl_library.get("rl_games", [])), width=12, break_long_words=False),
+        fill(", ".join(algorithms_per_rl_library.get("skrl", [])), width=12, break_long_words=False),
+        fill(", ".join(algorithms_per_rl_library.get("sb3", [])), width=12, break_long_words=False),
+    )
+    rl_library_table.add_row("Multi-agent support", State.No, State.No, State.Yes, State.No)
+    rl_library_table.add_row("Distributed training", State.Yes, State.Yes, State.Yes, State.No)
+    rl_library_table.add_row("Vectorized training", State.Yes, State.Yes, State.Yes, State.No)
+    rl_library_table.add_row("Fundamental/composite spaces", State.No, State.No, State.Yes, State.No)
+    cli_handler.output_table(rl_library_table)
+    # - prompt for RL libraries
+    supported_rl_libraries = _SINGLE_AGENT_RL_LIBRARIES if len(single_agent_workflow) else ["skrl"]
+    selected_rl_libraries = cli_handler.get_choices(
+        cli_handler.input_checkbox("RL library:", choices=[*supported_rl_libraries, "---", "all"]),
+        default=supported_rl_libraries,
+    )
+    # - prompt for algorithms per RL library
+    algorithms_per_rl_library = get_algorithms_per_rl_library(len(single_agent_workflow), len(multi_agent_workflow))
+    for rl_library in selected_rl_libraries:
+        algorithms = algorithms_per_rl_library.get(rl_library, [])
+        if len(algorithms) > 1:
+            algorithms = cli_handler.get_choices(
+                cli_handler.input_checkbox(f"RL algorithms for {rl_library}:", choices=[*algorithms, "---", "all"]),
+                default=algorithms,
+            )
+        rl_library_algorithms.append({"name": rl_library, "algorithms": [item.lower() for item in algorithms]})
+
+    specification = {
+        "external": is_external_project,
+        "path": project_path,
+        "name": project_name,
+        "task_name": task_name,
+        "robot_name": robot_name,
+        "include_ui_extension": include_ui_extension,
+        "workflows": workflow,
+        "rl_libraries": rl_library_algorithms,
+    }
+    generate(specification)
+
+
+if __name__ == "__main__":
+    main()
