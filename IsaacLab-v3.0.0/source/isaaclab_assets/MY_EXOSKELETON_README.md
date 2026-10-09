@@ -1,10 +1,14 @@
 # my_exoskeleton 论文适配训练任务
 
+中文源码阅读入口位于项目根目录 `MY_EXOSKELETON_CODE_GUIDE.zh-CN.md`。它面向零基础
+读者，按“训练入口 -> 环境配置 -> 观测/动作/奖励 -> 模仿数据 -> 输出与实体通讯”的
+顺序解释本项目自定义代码。
+
 本任务参考论文的多步态训练方法，结合当前外骨骼 URDF 和 Isaac Lab 接口进行了适配，并非逐项机械复刻。首次运行请先阅读[中文新手指南](MY_EXOSKELETON_BEGINNER_GUIDE.zh-CN.md)；各奖励项的公式和权重见 [`scripts/MY_EXOSKELETON_REWARDS.zh-CN.md`](../../scripts/MY_EXOSKELETON_REWARDS.zh-CN.md)，最终模型输出格式见 [`scripts/ruleresult.md`](../../scripts/ruleresult.md)，论文创新点与当前实现的逐项对应见 [MY_EXOSKELETON_PAPER_REPRODUCTION.zh-CN.md](MY_EXOSKELETON_PAPER_REPRODUCTION.zh-CN.md)。
 
 ## 当前实现
 
-- 机器人有 8 个可控旋转关节，动作是按关节缩放的增量关节位置目标：髋转向 `0.45 rad`、髋屈伸 `0.65 rad`、膝 `0.95 rad`、踝 `0.50 rad`（左右腿同构）。这些是策略命令尺度，不是机械安全限位。
+- 机器人有 8 个可控旋转关节。策略动作是相对默认姿态的位置偏移，实际目标为“默认关节角 + 动作 × 缩放”：髋转向 `0.45 rad`、髋屈伸 `0.65 rad`、膝 `0.95 rad`、踝 `0.50 rad`（左右腿同构）。这些是策略命令尺度，不是机械安全限位。
 - 仿真步长为 `0.005 s`，`decimation=4`，策略控制周期为 `0.02 s`。
 - 速度目标每 `3-6 s` 重采样；步态状态机以 `10 Hz` 更新。
 - Isaac 导入和 articulation 层均开启自碰撞；由于当前高密度 STL 凸包有相邻重叠，必须同时检查碰撞体排斥造成的姿态偏移。

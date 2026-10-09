@@ -1,3 +1,5 @@
+# BT 表示基础任务，AT 表示高级任务。这里的 ID 必须与数据目录名和命令行
+# --task_id 完全一致；name 只用于人类阅读，category 用于任务分类。
 version: 1
 description: Human-exoskeleton recording task identifiers.
 tasks:

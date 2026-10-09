@@ -1,4 +1,21 @@
-"""Gait-conditioned exoskeleton locomotion observations, commands, and rewards."""
+"""外骨骼基础行走任务的运行时逻辑。
+
+新手可以把本文件理解成环境的“计算公式集合”，它和环境配置文件配合使用：配置文件
+决定启用哪些项目及其权重，本文件负责真正计算观测、步态命令、奖励和课程阶段。
+Isaac Lab 会同时处理许多个并行环境，因此绝大多数张量的第 0 维都是 num_envs。
+
+推荐阅读顺序：
+
+1. MyExoskeletonFlatEnv：在 Isaac Lab 的标准 step 后记录输出；
+2. GaitVelocityCommand：维护五种步态、相位和速度命令；
+3. exoskeleton_observation：拼接 actor 可以看到的输入；
+4. exoskeleton_critic_observation：拼接仅训练期使用的特权输入；
+5. 本文件后半部分的奖励函数：每个函数返回 shape [num_envs]；
+6. advance_exoskeleton_curriculum：按全局控制步开放更难的任务。
+
+这里的关节角单位为 rad，角速度为 rad/s，力为 N，线速度为 m/s。代码中的网络动作
+仍是 8 维归一化值，不是实体电机协议中的原始整数。
+"""
 
 from __future__ import annotations
 
@@ -41,30 +58,63 @@ if TYPE_CHECKING:
     from isaaclab_assets.envs.my_exoskeleton_env_cfg import MyExoskeletonFlatEnvCfg
 
 
-# Forces below this threshold are sensor noise rather than a foot-ground contact.
+# 足底法向力小于该阈值时按传感器噪声处理，而不是一次真实着地。
 CONTACT_FORCE_THRESHOLD_N = 5.0
 GAIT_UPDATE_PERIOD_S = 0.1
-"""Gait-command update period [s], matching the paper's 10 Hz command layer."""
+"""步态命令层更新周期 [s]，即论文中的 10 Hz；策略控制本身仍为 50 Hz。"""
 
 WALK_TO_STAND_HOLD_S = 1.5
 RUN_TO_WALK_HOLD_S = 2.5
 
 
+# -----------------------------------------------------------------------------
+# 张量兼容与规范关节顺序
+# -----------------------------------------------------------------------------
+
+
 def _optional_sensor_enabled(env, name: str) -> bool:
-    """Read an optional sensor switch while preserving legacy flat configs."""
+    """读取可选传感器开关，并兼容没有该字段的旧配置。
+
+    Args:
+        env: Isaac Lab 环境或测试替身。
+        name: 传感器通道短名称，例如 ``imu``、``contact``。
+
+    Returns:
+        配置中的 ``use_<name>`` 布尔值；旧配置没有该字段时返回 ``True``。
+    """
 
     cfg = getattr(env, "cfg", None)
     return bool(getattr(cfg, f"use_{name}", True))
 
 
 def _as_tensor(value: torch.Tensor) -> torch.Tensor:
-    """Return the Torch view exposed by either native or wrapped simulation data."""
+    """统一取得原生张量或仿真包装对象暴露的 Torch 视图。
+
+    Args:
+        value: :class:`torch.Tensor`，或带有 ``.torch`` 属性的 Isaac Lab 数组。
+
+    Returns:
+        与输入共享同一份仿真数据的 Torch 张量；不复制数值。
+    """
 
     return value.torch if hasattr(value, "torch") else value
 
 
 def _canonical_joint_tensor(env, value: torch.Tensor) -> torch.Tensor:
-    """Reorder an articulation joint tensor to the public eight-joint contract."""
+    """把关节张量最后一维重排为项目公开的八关节固定顺序。
+
+    Args:
+        env: 包含 ``scene["robot"]`` 的环境。
+        value: 关节数据，通常 shape 为 ``[num_envs, 8]``；最后一维不是八时原样
+            返回，供不适用关节重排的测试数据继续使用。
+
+    Returns:
+        shape 与输入相同、最后一维按 ``ACTUATED_JOINT_NAMES`` 排列的张量。首次
+        调用解析名称下标，之后缓存在环境上，避免每个控制周期重复查找。
+
+    Raises:
+        ValueError: 机器人缺少任一规范关节。
+    """
 
     value = _as_tensor(value)
     if value.ndim < 2 or value.shape[-1] != len(ACTUATED_JOINT_NAMES):
@@ -83,13 +133,31 @@ def _canonical_joint_tensor(env, value: torch.Tensor) -> torch.Tensor:
     return value.index_select(-1, indices)
 
 
+# -----------------------------------------------------------------------------
+# 环境与五步态命令状态机
+# -----------------------------------------------------------------------------
+
+
 class MyExoskeletonFlatEnv(RuleresultRecorderMixin, ManagerBasedRLEnv):
-    """Manager-based RL environment for an eight-DOF exoskeleton."""
+    """八自由度外骨骼的 Isaac Lab 管理器式强化学习环境。
+
+    大部分训练逻辑由 Isaac Lab 的动作、观测、奖励和终止管理器执行。本子类只在
+    标准 ``step`` 结束后调用 :class:`RuleresultRecorderMixin`，把策略目标整理成
+    可选的结构化输出。
+    """
 
     cfg: MyExoskeletonFlatEnvCfg
 
     def step(self, action: torch.Tensor):
-        """Step the environment and optionally emit the structured model result."""
+        """推进一个策略控制周期，并按需记录结构化模型结果。
+
+        Args:
+            action: Actor 输出的归一化动作，shape 为 ``[num_envs, 8]``。它不是
+                电机角度，也不是 55AA 协议整数。
+
+        Returns:
+            与 :meth:`ManagerBasedRLEnv.step` 完全相同的环境步进结果。
+        """
 
         result = super().step(action)
         self._ruleresult_record_after_step(result)
@@ -97,20 +165,33 @@ class MyExoskeletonFlatEnv(RuleresultRecorderMixin, ManagerBasedRLEnv):
 
 
 class GaitVelocityCommand(UniformVelocityCommand):
-    """Velocity command with a five-mode gait state machine.
+    """带五种步态有限状态机的速度命令项。
 
-    Velocity targets are held for several seconds by the normal command term,
-    while this state machine updates at 10 Hz. This separates the paper's
-    command-layer frequency from Isaac Lab's target-resampling interval and
-    leaves enough time to satisfy the 1.5 s and 2.5 s transition criteria.
+    Isaac Lab 原始命令项每隔数秒重新采样一次目标速度，本状态机则以 10 Hz 检查
+    Walk、Stand、Walk-to-Stand、Run 和 Run-to-Walk 的切换条件。分开这两个频率，
+    既能让一个目标保持足够长时间，又能累计停稳 1.5 s、跑转走 2.5 s 等条件。
+
+    所有逐环境状态张量的 shape 均为 ``[num_envs]``：``gait_mode`` 是整数标签，
+    ``gait_phase`` 是 ``[0, 2*pi)`` 的相位 [rad]，``transition_time`` 和
+    ``stable_time`` 的单位为秒。
     """
 
     def __init__(self, cfg, env):
+        """创建速度命令项及每个并行环境的步态状态。
+
+        Args:
+            cfg: ``UniformVelocityCommand`` 配置，包含速度范围、参考数据路径和
+                重采样周期。
+            env: 拥有 ``num_envs`` 个并行实例的 Isaac Lab 环境。
+
+        Notes:
+            参考路径是目录时留给多模态模仿环境加载；是文件时由旧版
+            :class:`SensorReferenceBuffer` 直接读取。这样两种数据路径不会重复加载。
+        """
+
         super().__init__(cfg, env)
-        # Imitation environments can assign a calibrated forward speed to
-        # each environment after sampling a dataset task.  ``nan`` means that
-        # the ordinary curriculum/configured command ranges remain active,
-        # which preserves the legacy flat-task behavior.
+        # 模仿环境可按数据集任务固定每个环境的前进速度；NaN 表示不覆盖，让普通
+        # 平地任务继续使用课程/配置中的随机命令范围。
         self.task_speed_m_s = torch.full((self.num_envs,), float("nan"), device=self.device)
         self.gait_mode = torch.full((self.num_envs,), int(GaitMode.WALK), dtype=torch.long, device=self.device)
         self.gait_phase = torch.rand(self.num_envs, device=self.device) * (2.0 * math.pi)
@@ -122,9 +203,8 @@ class GaitVelocityCommand(UniformVelocityCommand):
         reference_path = getattr(cfg, "reference_data_path", None)
         self.reference_buffer = None
         self.reference_random_start = bool(getattr(cfg, "reference_random_start", False))
-        # A directory is the multimodal recording root used by the imitation
-        # task.  It is loaded by ``MyExoskeletonImitationEnv``; the legacy
-        # SensorReferenceBuffer only accepts a single trajectory file.
+        # 目录表示多模态数据集根目录，由 MyExoskeletonImitationEnv 加载；旧版
+        # SensorReferenceBuffer 只接受单个轨迹文件。
         self.imitation_dataset_path = None
         if reference_path and Path(reference_path).is_dir():
             self.imitation_dataset_path = str(reference_path)
@@ -137,18 +217,30 @@ class GaitVelocityCommand(UniformVelocityCommand):
             )
 
     def _static_task_mask(self) -> torch.Tensor:
-        """Return environments pinned to a static task such as BT01.
+        """找出被数据集任务固定为静止目标的环境。
 
-        ``nan`` in :attr:`task_speed_m_s` means that the legacy flat task is
-        using its normal command sampler.  Only finite task overrides below
-        the standing threshold are treated as static; this keeps the gait
-        curriculum unchanged for every ordinary walking environment.
+        ``task_speed_m_s`` 中的 NaN 表示普通平地任务仍使用命令采样器，不属于静止
+        覆盖。只有“有限数值且速度绝对值小于 0.1 m/s”的任务（例如 BT01）才为静止。
+
+        Returns:
+            布尔掩码，shape 为 ``[num_envs]``；``True`` 表示必须保持 Stand。
         """
 
         return torch.isfinite(self.task_speed_m_s) & (self.task_speed_m_s.abs() < 0.1)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
-        """Reset commands and initialize gait state for the selected environments."""
+        """重置选中环境的命令、相位、计时器和初始步态。
+
+        Args:
+            env_ids: 要重置的环境下标；``None`` 表示全部环境。
+
+        Returns:
+            父类命令项返回的重置指标字典。
+
+        Notes:
+            初始模式受当前课程阶段、命令速度和静止任务覆盖共同决定。多步态阶段
+            使用 Froude 数区分 Walk 与 Run，而静止数据任务始终优先设为 Stand。
+        """
 
         metrics = super().reset(env_ids)
         ids = slice(None) if env_ids is None else env_ids
@@ -180,13 +272,20 @@ class GaitVelocityCommand(UniformVelocityCommand):
         return metrics
 
     def compute(self, dt: float):
-        """Update the velocity command, gait phase, and transition state."""
+        """更新速度命令、参考序列、步态相位和状态机。
+
+        Args:
+            dt: 本次策略控制周期 [s]，当前通常为 0.02 s（50 Hz）。
+
+        Notes:
+            相位每个策略周期更新；模式切换累计到 0.1 s 后才检查一次，即 10 Hz。
+            这种分频不能简单替换成“每五步更新”，因为未来控制周期可能改变。
+        """
 
         super().compute(dt)
         if self.reference_buffer is not None:
-            # The command term is called at the policy control rate.  Keep the
-            # conversion explicit so a future decimation change cannot silently
-            # desynchronize the recording and the reward.
+            # 命令项以策略控制频率调用。显式换算参考序列步数，避免未来修改
+            # decimation 后，录制目标和奖励时间轴悄悄失步。
             steps = max(1, int(round(dt / float(getattr(self.cfg, "reference_target_dt_s", 0.02)))))
             self.reference_buffer.advance(steps)
         self._advance_phase(dt)
@@ -197,7 +296,15 @@ class GaitVelocityCommand(UniformVelocityCommand):
             self._advance_mode(elapsed)
 
     def set_curriculum_phase(self, phase: CurriculumPhase):
-        """Set the active curriculum phase and remove unavailable gait labels."""
+        """设置课程阶段，并清除该阶段尚未开放的步态标签。
+
+        Args:
+            phase: Walk-only、Transitions 或 Multi-gait 阶段。
+
+        Notes:
+            阶段回退时必须同步改写已有环境标签，否则奖励掩码仍会激活尚未开放的
+            Run 等奖励。静止任务覆盖在所有阶段都保持 Stand 且相位为零。
+        """
 
         self.curriculum_phase = CurriculumPhase(phase)
         static = self._static_task_mask()
@@ -214,15 +321,18 @@ class GaitVelocityCommand(UniformVelocityCommand):
         self.gait_phase[static] = 0.0
 
     def set_task_speed(self, env_ids: Sequence[int] | torch.Tensor, speed_m_s: torch.Tensor | float) -> None:
-        """Pin selected environments to task-specific forward speed targets.
+        """把选中环境固定到数据集任务规定的前进速度。
 
         Args:
-            env_ids: Environment indices to update.
-            speed_m_s: Forward target speed [m/s], scalar or one value per ID.
+            env_ids: 要更新的环境下标，shape 为 ``[K]``。
+            speed_m_s: 前进目标速度 [m/s]；可以是标量或每个环境一个值 ``[K]``。
 
-        The override is applied both immediately and after later command
-        resampling.  It is intentionally opt-in so the original flat task
-        continues to use its curriculum ranges.
+        Raises:
+            ValueError: 速度数量与环境数量不同，或包含 NaN/无穷大。
+
+        Notes:
+            覆盖会立即写入命令，并在以后每次命令重采样后再次写入。没有调用本方法
+            的普通平地任务仍使用原课程范围。
         """
 
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).reshape(-1)
@@ -245,12 +355,14 @@ class GaitVelocityCommand(UniformVelocityCommand):
             torch.full_like(self.gait_mode[ids], int(GaitMode.STAND)),
             torch.full_like(self.gait_mode[ids], int(GaitMode.WALK)),
         )
-        self.gait_phase[ids] = torch.where(
-            static, torch.zeros_like(self.gait_phase[ids]), self.gait_phase[ids]
-        )
+        self.gait_phase[ids] = torch.where(static, torch.zeros_like(self.gait_phase[ids]), self.gait_phase[ids])
 
     def clear_task_speed(self, env_ids: Sequence[int] | torch.Tensor) -> None:
-        """Restore configured/curriculum command sampling for selected IDs."""
+        """清除任务速度覆盖，恢复配置/课程控制的命令采样。
+
+        Args:
+            env_ids: 要恢复的环境下标，shape 为 ``[K]``。
+        """
 
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).reshape(-1)
         if ids.numel():
@@ -258,7 +370,15 @@ class GaitVelocityCommand(UniformVelocityCommand):
             self.gait_mode[ids] = int(GaitMode.WALK)
 
     def _resample_command(self, env_ids: Sequence[int]):
-        """Sample commands, then reapply any imitation task speed overrides."""
+        """先调用父类采样命令，再重新应用有效的模仿任务速度覆盖。
+
+        Args:
+            env_ids: 要重采样的环境下标或 slice。
+
+        Notes:
+            若不在父类采样后重写，数秒一次的随机命令会覆盖数据集指定速度，使目标
+            运动与教师序列不再同步。
+        """
 
         if isinstance(env_ids, slice):
             start, stop, step = env_ids.indices(self.num_envs)
@@ -286,7 +406,11 @@ class GaitVelocityCommand(UniformVelocityCommand):
             )
 
     def _resample(self, env_ids: Sequence[int]):
-        """Normalize a full-slice reset before the base resampling helper."""
+        """把全量 slice 统一成下标张量后调用父类重采样流程。
+
+        Args:
+            env_ids: 环境下标序列或父类全量重置传入的 slice。
+        """
 
         if isinstance(env_ids, slice):
             start, stop, step = env_ids.indices(self.num_envs)
@@ -294,6 +418,16 @@ class GaitVelocityCommand(UniformVelocityCommand):
         super()._resample(env_ids)
 
     def _advance_phase(self, dt: float):
+        """按当前步态的节奏推进每个环境的周期相位。
+
+        Args:
+            dt: 策略控制周期 [s]。
+
+        Notes:
+            cadence 单位为周期每秒 [Hz]，所以相位增量为 ``2*pi*cadence*dt``。
+            Stand 的 cadence 为零，并额外把相位固定为零，避免静止奖励随相位变化。
+        """
+
         cadence = torch.zeros(self.num_envs, device=self.device)
         cadence[self.gait_mode == int(GaitMode.WALK)] = 0.8
         cadence[self.gait_mode == int(GaitMode.WALK_TO_STAND)] = 0.6
@@ -303,6 +437,20 @@ class GaitVelocityCommand(UniformVelocityCommand):
         self.gait_phase[self.gait_mode == int(GaitMode.STAND)] = 0.0
 
     def _advance_mode(self, dt: float):
+        """以 10 Hz 检查并执行五步态状态转换。
+
+        Args:
+            dt: 自上次模式更新以来累计的时间 [s]，通常约 0.1 s。
+
+        状态机原因：
+            - Walk-only 阶段只允许 Walk，静止数据任务除外；
+            - 低速命令先进入 Walk-to-Stand，只有双脚支撑且机身低速连续保持
+              ``WALK_TO_STAND_HOLD_S`` 才进入 Stand，避免经过零速度时误判停稳；
+            - Multi-gait 阶段用 Froude 数判断 Run；Run 收到走路命令后先进入
+              Run-to-Walk，保持 ``RUN_TO_WALK_HOLD_S`` 后才变为 Walk；
+            - 数据集静止任务拥有最高优先级，始终覆盖成 Stand。
+        """
+
         static = self._static_task_mask()
         if self.curriculum_phase == CurriculumPhase.WALK_ONLY:
             self.gait_mode[:] = torch.where(
@@ -366,13 +514,36 @@ class GaitVelocityCommand(UniformVelocityCommand):
 
     @property
     def reference_sample(self) -> dict[str, torch.Tensor] | None:
-        """Return the current sensor reference for each environment, if enabled."""
+        """返回当前逐环境传感器参考；未加载参考文件时返回 ``None``。
+
+        Returns:
+            参考通道字典。典型关节张量 shape 为 ``[num_envs, 8]``；是否存在速度、
+            IMU 和接触通道由输入录制文件决定。
+        """
 
         return None if self.reference_buffer is None else self.reference_buffer.sample()
 
 
+# -----------------------------------------------------------------------------
+# 传感器读取与 Actor/Critic 观测
+# -----------------------------------------------------------------------------
+
+
 def _sensor_stats(sensor, env_count: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return normal-force sum, mean, and standard deviation per environment."""
+    """汇总一个足底接触传感器在每个环境中的法向力统计量。
+
+    Args:
+        sensor: 必须提供 ``data.net_normal_forces_w`` 的 ContactSensor。
+        env_count: 并行环境数量 ``N``。
+        device: 输出张量所在的 Torch 设备。
+
+    Returns:
+        ``(总和, 均值, 标准差)``，每项单位为牛顿 [N]、shape 均为 ``[N]``。
+
+    Raises:
+        RuntimeError: 传感器没有法向力缓冲区。
+        ValueError: 原始力不是 ``[N, num_sensors, 3]``。
+    """
     try:
         force_value = sensor.data.net_normal_forces_w
     except AttributeError as exc:
@@ -392,7 +563,15 @@ def _sensor_stats(sensor, env_count: int, device: torch.device) -> tuple[torch.T
 
 
 def _foot_contacts(env) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read left/right ContactSensor net forces and convert them to contact magnitudes."""
+    """读取左右脚接触力幅值。
+
+    Args:
+        env: 包含左右足底 ContactSensor 的环境。
+
+    Returns:
+        ``(左脚力, 右脚力)``，单位为牛顿 [N]，每项 shape 为 ``[num_envs]``。
+        接触通道关闭时返回全零，保持观测维度和 checkpoint 契约不变。
+    """
     if not _optional_sensor_enabled(env, "contact"):
         zeros = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
         return zeros, zeros.clone()
@@ -402,7 +581,12 @@ def _foot_contacts(env) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _foot_pressure_features(env) -> torch.Tensor:
-    """Return [left mean, left std, right mean, right std] contact features."""
+    """构造左右脚接触压力代理特征。
+
+    Returns:
+        按“左均值、左标准差、右均值、右标准差”排列的张量 [N]，shape 为
+        ``[num_envs, 4]``。接触通道关闭时为全零。
+    """
     if not _optional_sensor_enabled(env, "contact"):
         return torch.zeros((env.num_envs, 4), device=env.device, dtype=torch.float32)
     left = _sensor_stats(env.scene["left_foot_contact"], env.num_envs, env.device)
@@ -411,7 +595,11 @@ def _foot_pressure_features(env) -> torch.Tensor:
 
 
 def _reference_sample(env) -> dict[str, torch.Tensor] | None:
-    """Return the command-owned reference sample, if a recording is enabled."""
+    """从步态命令项取得当前录制参考样本。
+
+    Returns:
+        当前逐环境参考通道字典；命令项不支持参考数据或未启用时返回 ``None``。
+    """
 
     try:
         sample = _gait_command(env).reference_sample
@@ -421,11 +609,18 @@ def _reference_sample(env) -> dict[str, torch.Tensor] | None:
 
 
 def _imu_gyro_features(env) -> torch.Tensor:
-    """Return six link-IMU gyro vectors in the canonical sensor order.
+    """按规范传感器顺序读取六个连杆 IMU 的角速度。
 
-    The fallback repeats the articulated root gyro.  It keeps unit tests and
-    old scenes usable, but a real imitation run should provide all six IMUs so
-    that the fallback is never used.
+    Returns:
+        IMU 角速度 [rad/s]，shape 为 ``[num_envs, 6, 3]``。通道关闭时返回全零；
+        旧场景缺少连杆 IMU 时重复根节点角速度作为兼容回退。
+
+    Raises:
+        ValueError: 已找到的 IMU 张量不是 ``[N, 3]`` 或 ``[N, 1, 3]``。
+
+    Notes:
+        根节点回退只为旧场景和轻量测试保留。正式模仿训练应提供全部六个 IMU，
+        否则六个位置会收到相同信号，不能代表真实连杆运动。
     """
 
     root_gyro = _base(env)[1]
@@ -435,10 +630,8 @@ def _imu_gyro_features(env) -> torch.Tensor:
             device=root_gyro.device,
             dtype=root_gyro.dtype,
         )
-    # The imitation task exposes recorder IDs (imu_01..imu_06), while the
-    # legacy flat task keeps the original anatomical aliases.  Prefer the
-    # environment's explicit contract and retain the root-gyro fallback for
-    # scenes that do not instantiate link IMUs.
+    # 模仿任务使用采集器编号 imu_01..imu_06，旧平地任务仍保留解剖学别名；优先
+    # 使用环境显式声明的顺序，场景没有创建连杆 IMU 时才回退到根节点角速度。
     sensor_names = tuple(getattr(env, "imitation_imu_sensor_names", IMU_SENSOR_NAMES))
     readings = []
     for sensor_name in sensor_names:
@@ -465,13 +658,31 @@ def sensor_reference_imitation_reward(
     gyro_sigma: float = 1.0,
     contact_sigma: float = 0.35,
 ):
-    """Score agreement with an optional recorded sensor trajectory.
+    """计算仿真状态与可选录制轨迹的一致性奖励。
 
-    The reference is sampled by :class:`GaitVelocityCommand` at the policy
-    rate.  Missing optional channels are omitted and the remaining weights are
-    renormalized, so a joint-angle-only recording is valid.  This term is a
-    training signal; it must not be enabled with a recording whose joint order,
-    zero offsets, or sensor frames have not been calibrated.
+    :class:`GaitVelocityCommand` 以策略频率推进参考。缺失或关闭的可选通道不参与
+    计算，剩余权重重新归一化，因此只有关节角的数据也可以使用。各通道先按 sigma
+    缩放平方误差，再通过指数核映射到 ``[0, 1]``。
+
+    Args:
+        env: 并行强化学习环境。
+        joint_pos_weight: 关节角通道权重。
+        joint_vel_weight: 关节角速度通道权重。
+        gyro_weight: 六 IMU 角速度通道权重。
+        contact_weight: 左右脚接触标签通道权重。
+        joint_pos_sigma: 关节角误差尺度 [rad]。
+        joint_vel_sigma: 关节角速度误差尺度 [rad/s]。
+        gyro_sigma: IMU 角速度误差尺度 [rad/s]。
+        contact_sigma: 二值接触误差尺度，无单位。
+
+    Returns:
+        每环境模仿相似度，shape 为 ``[num_envs]``。未加载参考时返回全零。
+
+    Raises:
+        ValueError: 权重为负、全部权重为零，或任一 sigma 不为正。
+
+    Notes:
+        这是训练信号，不应配合关节顺序、零位或传感器坐标系未经标定的录制数据。
     """
 
     weights = (joint_pos_weight, joint_vel_weight, gyro_weight, contact_weight)
@@ -514,10 +725,8 @@ def sensor_reference_imitation_reward(
         scores.append(torch.exp(-torch.mean(torch.square((contact - reference_contact) / contact_sigma), dim=-1)))
         active_weights.append(contact_weight)
 
-    # Optional IMU/contact switches can remove every reference channel except
-    # the mandatory joint stream.  Be defensive for a caller that also sets
-    # the joint weights to zero: a disabled imitation term must be finite and
-    # neutral rather than producing a 0/0 NaN.
+    # 当前实现总会先加入关节位置通道，即使它的权重是 0，所以此列表通常不会为空。
+    # 这个分支只是为未来可能“跳过全部通道”的改动留保护，它并不检查权重之和是否为 0。
     if not active_weights:
         return zero
     total_weight = sum(active_weights)
@@ -525,22 +734,29 @@ def sensor_reference_imitation_reward(
     if "gait_id" in sample:
         gait = _gait_command(env)
         reference_gait = sample["gait_id"].to(device=joint_pos.device)
-        # A negative label means "all modes" and is useful for recordings
-        # without a synchronized gait classifier.
+        # 负 gait 标签表示“适用于所有模式”，供没有同步步态分类器的录制使用。
         valid = (reference_gait < 0) | (reference_gait == gait.gait_mode)
         score = score * valid.to(dtype=score.dtype)
     return score
 
 
 def exoskeleton_observation(env) -> torch.Tensor:
-    """Build the 49-D gait-conditioned policy vector.
+    """拼接 Actor 使用的 49 维步态条件观测。
 
-    Layout: projected gravity (3), base angular/linear velocity (3+3), joint
-    position/velocity/previous normalized action (8+8+8), left/right contact
-    magnitudes (1+1), left/right pressure mean and standard deviation (4), and
-    velocity command (3), gait phase sine/cosine (2), and gait one-hot (5).
-    ContactSensor exposes aggregate forces rather than Gazebo's 60 bins; the
-    aggregate is used as a stable pressure mean/std proxy.
+    Args:
+        env: 包含机器人、动作管理器、速度命令和足底传感器的环境。
+
+    Returns:
+        shape 为 ``[num_envs, 49]`` 的观测，依次为：投影重力 3、机身角速度 3、
+        机身线速度 3、关节角/角速度/上一归一化动作各 8、左右接触力各 1、左右脚
+        压力均值/标准差 4、速度命令 3、步态相位 sin/cos 2、五步态 one-hot 5。
+
+    Raises:
+        ValueError: 上一动作不是与八关节位置相同的 ``[num_envs, 8]`` shape。
+
+    Notes:
+        ContactSensor 只给聚合力，不是论文/Gazebo 的 60 点压力阵列，因此这里用
+        聚合力的均值和标准差作为固定维度代理。
     """
     robot = env.scene["robot"]
     data = robot.data
@@ -549,10 +765,8 @@ def exoskeleton_observation(env) -> torch.Tensor:
     lin = _as_tensor(data.root_lin_vel_b)
     pos = _canonical_joint_tensor(env, data.joint_pos)
     vel = _canonical_joint_tensor(env, data.joint_vel)
-    # The paper exposes the previous policy action.  ``prev_action`` is the
-    # normalized action sent to the manager, not a position target; adding it
-    # to the current joint position would therefore mix radians and normalized
-    # units and would describe neither the controller input nor its target.
+    # 论文使用“上一策略动作”。prev_action 是交给动作管理器的归一化值，不是位置
+    # 目标；若把它与当前关节角相加，会混合 rad 与无量纲数值，物理意义错误。
     action_manager = getattr(env, "action_manager", None)
     previous_action = (
         torch.zeros_like(pos) if action_manager is None else _as_tensor(getattr(action_manager, "prev_action"))
@@ -588,7 +802,13 @@ def exoskeleton_observation(env) -> torch.Tensor:
 
 
 def exoskeleton_critic_observation(env) -> torch.Tensor:
-    """Build privileged critic observations with contact and dynamics state."""
+    """构造只在训练期提供给 Critic 的 62 维特权观测。
+
+    Returns:
+        shape 为 ``[num_envs, 62]`` 的张量：Actor 的 49 维观测，加左右接触标签 2、
+        归一化接触力 2、根节点高度 1 和八关节角加速度 8。部署 Actor 不需要这些
+        特权量。
+    """
 
     policy = exoskeleton_observation(env)
     robot = env.scene["robot"]
@@ -603,14 +823,26 @@ def exoskeleton_critic_observation(env) -> torch.Tensor:
 
 
 def _base(env):
-    """Return root state tensors in the simulation device."""
+    """取得机身根节点状态的 Torch 张量。
+
+    Returns:
+        ``(机身坐标线速度 [m/s], 机身坐标角速度 [rad/s], 世界坐标四元数)``；
+        shape 分别为 ``[N, 3]``、``[N, 3]``、``[N, 4]``。
+    """
     data = env.scene["robot"].data
     values = (data.root_lin_vel_b, data.root_ang_vel_b, data.root_quat_w)
     return tuple(_as_tensor(value) for value in values)
 
 
 def _gait_command(env) -> GaitVelocityCommand:
-    """Return the gait-aware base velocity command term."""
+    """取得带步态状态机的 ``base_velocity`` 命令项。
+
+    Returns:
+        当前环境的 :class:`GaitVelocityCommand`。
+
+    Raises:
+        TypeError: 配置使用了不含 ``gait_mode`` 的普通速度命令项。
+    """
 
     term = env.command_manager.get_term("base_velocity")
     if not hasattr(term, "gait_mode"):
@@ -619,22 +851,42 @@ def _gait_command(env) -> GaitVelocityCommand:
 
 
 def gait_mask(env, gait: GaitMode | int) -> torch.Tensor:
-    """Return a per-environment float mask for one gait label."""
+    """生成只激活指定步态环境的浮点掩码。
+
+    Args:
+        env: 并行环境。
+        gait: 目标步态枚举或整数标签。
+
+    Returns:
+        值为 0 或 1 的张量，shape 为 ``[num_envs]``。
+    """
 
     return _shared_gait_mask(env, gait)
 
 
 def _masked(value: torch.Tensor, env, gait: GaitMode | int) -> torch.Tensor:
+    """把逐环境奖励限制到指定步态，其他步态置零。
+
+    Args:
+        value: 原始逐环境奖励，shape 为 ``[num_envs]``。
+        env: 并行环境。
+        gait: 应激活该奖励的步态。
+
+    Returns:
+        应用同 shape 步态掩码后的奖励。
+    """
+
     return value * gait_mask(env, gait).to(value.dtype)
 
 
 def _locomotion_mask(env) -> torch.Tensor:
-    """Return one for walking, running, and transition gaits.
+    """为走、跑及两种过渡步态返回 1，为 Stand 返回 0。
 
-    A few shared biomechanical terms should not reward leg motion while the
-    robot is in the static ``STAND`` mode.  Keeping this helper tolerant of
-    small unit-test fakes also makes the reward functions usable before the
-    command manager has been constructed.
+    Returns:
+        浮点掩码，shape 为 ``[num_envs]``。轻量测试替身没有命令管理器时返回全 1。
+
+    Notes:
+        共用生物力学奖励不应鼓励 Stand 时摆腿，因此使用本掩码排除静止模式。
     """
 
     try:
@@ -651,7 +903,15 @@ def _locomotion_mask(env) -> torch.Tensor:
 
 
 def _forward_motion_gate(env, speed_scale: float = 0.2) -> torch.Tensor:
-    """Return a bounded gate that is zero for a stationary policy."""
+    """按实际正向速度生成 ``[0, 1]`` 活动门，原地策略严格为零。
+
+    Args:
+        env: 并行环境。
+        speed_scale: 门控达到 1 所需的正向速度 [m/s]。
+
+    Returns:
+        shape 为 ``[num_envs]`` 的门控值。
+    """
 
     if speed_scale <= 0.0:
         raise ValueError("speed_scale must be positive")
@@ -660,7 +920,11 @@ def _forward_motion_gate(env, speed_scale: float = 0.2) -> torch.Tensor:
 
 
 def tracking_reward(env):
-    """Reward exponential tracking of commanded planar velocity and yaw rate."""
+    """奖励平面线速度和偏航角速度同时跟踪命令。
+
+    Returns:
+        三项平方误差的指数相似度，shape 为 ``[num_envs]``，范围 ``(0, 1]``。
+    """
     lin, ang, _ = _base(env)
     cmd = env.command_manager.get_command("base_velocity")
     error = torch.cat((lin[:, :2] - cmd[:, :2], ang[:, 2:3] - cmd[:, 2:3]), dim=-1)
@@ -673,11 +937,20 @@ def tracking_linear_velocity_reward(
     activity_gate_speed: float | None = None,
     activity_gate_command_max: float | None = None,
 ):
-    """Reward planar command tracking, optionally requiring low-speed forward activity.
+    """奖励平面速度命令跟踪，并可要求低速命令下确实向前运动。
 
-    The low-speed gate is used only for the fixed forward curriculum.  It removes
-    the stationary ``exp(-0.2**2 / std**2)`` shortcut without making the higher
-    speed command distribution unnecessarily sharp.
+    Args:
+        env: 并行环境。
+        std: 平面速度误差的指数核尺度 [m/s]。
+        activity_gate_speed: 实际正向速度门控达到 1 的尺度 [m/s]。
+        activity_gate_command_max: 只对不超过该幅值的低速命令启用活动门 [m/s]。
+
+    Returns:
+        每环境跟踪相似度，shape 为 ``[num_envs]``。
+
+    Notes:
+        低速门只服务固定前进课程，用于消除站着不动仍获得
+        ``exp(-0.2**2/std**2)`` 的捷径，而不让高速命令分布变得过尖。
     """
 
     lin, _, _ = _base(env)
@@ -698,7 +971,15 @@ def tracking_linear_velocity_reward(
 
 
 def tracking_yaw_velocity_reward(env, std: float = 0.5):
-    """Reward yaw-rate command tracking with an exponential kernel."""
+    """用指数核奖励偏航角速度命令跟踪。
+
+    Args:
+        env: 并行环境。
+        std: 偏航角速度误差尺度 [rad/s]。
+
+    Returns:
+        每环境相似度，shape 为 ``[num_envs]``。
+    """
 
     _, ang, _ = _base(env)
     command = env.command_manager.get_command("base_velocity")
@@ -714,25 +995,23 @@ def fixed_forward_walk_reward(
     command_speed_tolerance: float | None = None,
     gait: GaitMode | int | None = None,
 ):
-    """Reward walking at a target velocity along the robot's body-frame positive x-axis.
+    """奖励沿机身坐标正 x 方向以固定目标速度直行。
 
-    The speed window is deliberately zero at rest, reverse motion, and twice
-    the target speed.  This prevents the posture and contact terms from making
-    a stationary policy competitive with a walking policy.
+    速度窗在静止、倒退以及达到目标两倍速度时均为零，防止姿态和接触奖励让原地
+    站立策略与真正行走策略获得接近总分。
 
     Args:
-        env: The manager-based reinforcement-learning environment.
-        target_speed: Desired body-forward velocity [m/s]. Must be positive.
-        speed_tolerance: Half-width of the quadratic forward-speed window [m/s].
-        lateral_speed_std: Gaussian decay scale for body lateral velocity [m/s].
-        yaw_rate_std: Gaussian decay scale for body yaw velocity [rad/s].
-        command_speed_tolerance: Optional command-speed gate [m/s]. When set,
-            the term is faded out for later curriculum commands whose speed is
-            no longer the fixed walking target.
-        gait: Optional gait label used to route the term to one gait.
+        env: 管理器式强化学习环境。
+        target_speed: 机身正向目标速度 [m/s]，必须为正。
+        speed_tolerance: 二次正向速度窗口的半宽 [m/s]。
+        lateral_speed_std: 机身横向速度的高斯衰减尺度 [m/s]。
+        yaw_rate_std: 机身偏航角速度的高斯衰减尺度 [rad/s]。
+        command_speed_tolerance: 可选命令速度门控尺度 [m/s]；后续课程命令偏离固定
+            目标时逐渐关闭本奖励。
+        gait: 可选步态标签；传入时只给该步态计分。
 
     Returns:
-        A reward in ``[0, 1]`` for each environment.
+        每个环境 ``[0, 1]`` 的奖励，shape 为 ``[num_envs]``。
     """
     lin_vel_b, ang_vel_b, _ = _base(env)
     forward_speed = lin_vel_b[:, 0]
@@ -752,48 +1031,87 @@ def fixed_forward_walk_reward(
     return score
 
 
+# -----------------------------------------------------------------------------
+# 共享运动学、接触与生物力学奖励
+# -----------------------------------------------------------------------------
+
+
 def lin_vel_z_reward(env):
-    """Return vertical-speed magnitude for the configured negative weight."""
+    """返回机身竖直速度绝对值，供配置中的负权重形成惩罚。
+
+    Returns:
+        竖直速度幅值 [m/s]，shape 为 ``[num_envs]``。
+    """
+
     return torch.abs(_base(env)[0][:, 2])
 
 
 def ang_vel_xy_reward(env):
-    """Return roll/pitch angular-speed magnitude for the configured negative weight."""
+    """返回滚转和俯仰角速度绝对值之和，供负权重惩罚晃动。
+
+    Returns:
+        角速度幅值 [rad/s]，shape 为 ``[num_envs]``。
+    """
+
     return torch.abs(_base(env)[1][:, :2]).sum(dim=-1)
 
 
 def orientation_reward(env):
-    """Return uprightness score based on roll and pitch."""
+    """根据机身滚转角和俯仰角计算直立分数。
+
+    Returns:
+        ``1 - |roll| - |pitch|``，shape 为 ``[num_envs]``。倾斜很大时可为负值。
+    """
+
     roll, pitch, _ = euler_xyz_from_quat(_base(env)[2])
     return 1.0 - torch.abs(roll) - torch.abs(pitch)
 
 
 def torque_reward(env):
-    """Return squared joint effort; RewardTermCfg supplies -1e-6."""
+    """返回所有执行关节力矩平方和，由配置负权重转换为能耗惩罚。
+
+    Returns:
+        力矩平方和 [(N*m)^2]，shape 为 ``[num_envs]``。函数本身返回正成本，
+        ``RewardTermCfg`` 当前使用 ``-1e-6`` 权重。
+    """
+
     effort = _as_tensor(env.scene["robot"].data.applied_torque)
     return effort.square().sum(dim=-1)
 
 
 def action_rate_reward(env):
-    """Return squared action change; RewardTermCfg supplies -0.1."""
+    """返回相邻策略动作变化的平方和，抑制指令抖动。
+
+    Returns:
+        无量纲归一化动作变化成本，shape 为 ``[num_envs]``；配置用负权重形成惩罚。
+    """
+
     action = env.action_manager.action
     previous = env.action_manager.prev_action
     return (action - previous).square().sum(dim=-1)
 
 
 def contact_reward(env):
-    """Reward having at least one foot in contact without rewarding impact magnitude.
+    """奖励至少一只脚有效接触地面，但不奖励撞击力大小。
 
-    Contact sensors report forces in newtons.  Returning the raw force here would make a
-    hard landing worth orders of magnitude more than velocity tracking, so this term is
-    deliberately bounded to ``[0, 1]``.
+    Returns:
+        二值奖励，shape 为 ``[num_envs]``。任一脚法向力大于阈值时为 1。
+
+    Notes:
+        传感器原始单位是牛顿。若直接返回原始力，重踩地面的奖励会比速度跟踪大
+        数个数量级，因此本项刻意限制为 ``[0, 1]``。
     """
     left, right = _foot_contacts(env)
     return ((left > CONTACT_FORCE_THRESHOLD_N) | (right > CONTACT_FORCE_THRESHOLD_N)).float()
 
 
 def foot_contact_alternation_reward(env):
-    """Reward exclusive left/right contact, encouraging alternating gait phases."""
+    """奖励左右脚恰好一只着地，鼓励交替支撑。
+
+    Returns:
+        左右接触状态异或（XOR）的二值奖励，shape 为 ``[num_envs]``。
+    """
+
     left, right = _foot_contacts(env)
     left_on, right_on = left > CONTACT_FORCE_THRESHOLD_N, right > CONTACT_FORCE_THRESHOLD_N
     return (left_on ^ right_on).float()
@@ -808,12 +1126,23 @@ def feet_forward_alignment_reward(
     max_lateral_speed: float,
     max_yaw_rate: float,
 ):
-    """Reward both feet facing the commanded forward direction during straight walking.
+    """直行时奖励双脚朝向命令规定的前进方向。
 
-    The velocity command is expressed in the base frame.  For a positive
-    straight-ahead command, its world-frame direction is therefore the root
-    yaw direction.  Only yaw is compared: the left/right foot links have
-    mirrored roll frames even while their forward axes are parallel.
+    速度命令位于机身坐标系，正向直行对应世界系中的根节点偏航方向。这里只比较
+    yaw（偏航）；左右脚连杆的 roll 坐标轴互为镜像，即使前向轴平行也不能直接比较
+    完整四元数。
+
+    Args:
+        env: 并行环境。
+        asset_cfg: 指定机器人和有序双脚刚体的实体配置。
+        command_name: 速度命令项名称。
+        sigma: 双脚偏航误差的指数衰减尺度。
+        min_forward_speed: 启用奖励所需的最小前向命令 [m/s]。
+        max_lateral_speed: 仍视为直行的最大横向命令绝对值 [m/s]。
+        max_yaw_rate: 仍视为直行的最大偏航命令绝对值 [rad/s]。
+
+    Returns:
+        双脚平均朝向相似度；非直行命令时为零，shape 为 ``[num_envs]``。
     """
     robot = env.scene[asset_cfg.name]
     foot_quat = _as_tensor(robot.data.body_link_quat_w)
@@ -837,12 +1166,19 @@ def feet_forward_alignment_reward(
 
 
 def _centroidal_angular_momentum_z(data) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute total and side-split centroidal angular momentum about world ``z``.
+    """计算系统相对总质心的世界 z 轴角动量。
+
+    Args:
+        data: 机器人 articulation 数据，必须包含刚体质量、质心位置/速度、惯量和
+            连杆世界姿态。
 
     Returns:
-        A tuple containing total ``z`` angular momentum and the per-body
-        momentum vectors in ``[kg m^2/s]``.  The latter is used only by the
-        morphology-adapted replacement for the paper's arm term.
+        ``(总 z 角动量, 每刚体三维角动量)``，单位均为 ``kg*m^2/s``，shape 分别为
+        ``[num_envs]`` 和 ``[num_envs, num_bodies, 3]``。逐刚体结果用于替代论文中
+        不适用于无手臂外骨骼的手臂项。
+
+    Raises:
+        ValueError: 仿真后端返回的刚体状态 shape 不完整或不一致。
     """
 
     mass = _as_tensor(data.body_mass)
@@ -868,9 +1204,8 @@ def _centroidal_angular_momentum_z(data) -> tuple[torch.Tensor, torch.Tensor]:
     relative_pos = com_pos - centroid
     relative_vel = com_vel[..., :3] - centroid_vel
     orbital = torch.cross(relative_pos, mass.unsqueeze(-1) * relative_vel, dim=-1)
-    # PhysX returns COM-centered inertia in the rigid-body-prim frame as nine
-    # column-major values.  Convert to a row-major matrix and rotate it into
-    # world coordinates before multiplying by world angular velocity.
+    # PhysX 把质心惯量表示为刚体 prim 坐标系中的九个列主序值；先转成行主序 3x3
+    # 矩阵并旋转到世界系，再与世界角速度相乘。
     inertia_link = inertia.reshape(inertia.shape[0], inertia.shape[1], 3, 3).transpose(-1, -2)
     link_rotation_w = math_utils.matrix_from_quat(body_link_quat_w)
     inertia_world = link_rotation_w @ inertia_link @ link_rotation_w.transpose(-1, -2)
@@ -881,7 +1216,18 @@ def _centroidal_angular_momentum_z(data) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _side_momentum_z(body_momentum: torch.Tensor, asset_cfg: SceneEntityCfg) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split selected ordered body momenta into right and left halves."""
+    """把有序刚体角动量均分为右腿和左腿两组。
+
+    Args:
+        body_momentum: 每刚体三维角动量 [kg*m^2/s]，shape 为 ``[N, B, 3]``。
+        asset_cfg: ``body_ids`` 必须先列右腿刚体、再列等量左腿刚体。
+
+    Returns:
+        ``(左腿 z 角动量, 右腿 z 角动量)``，每项 shape 为 ``[N]``。
+
+    Raises:
+        ValueError: 选中刚体不足两个或数量不是偶数。
+    """
 
     ids = asset_cfg.body_ids
     selected = body_momentum if isinstance(ids, slice) else body_momentum[:, ids]
@@ -898,16 +1244,19 @@ def leg_momentum_balance_reward(
     asset_cfg: SceneEntityCfg,
     momentum_scale: float = 10.0,
 ):
-    """Implement the paper's angular-momentum cost for the legs-only robot.
+    """实现适配无手臂外骨骼后的角动量平衡项。
 
-    For the humanoid in the paper, Eq. (2) contains a total angular-momentum
-    cost and a mirrored left/right arm residual.  In this legs-only model the
-    adapted residual is ``(-L_left,z - L_right,z)`` in the shared world frame.
+    论文公式包含总角动量成本和镜像左右手臂残差。本模型没有手臂，因此透明地改用
+    有序左右腿刚体角动量，世界系残差为 ``-L_left,z - L_right,z``。总角动量仍由
+    Isaac Lab 中真实质量、质心位置/速度和世界系惯量计算。
 
-    The exoskeleton has no arms, so the second term uses ordered left/right
-    leg-body momentum as a transparent morphology-adapted surrogate.  The
-    total term is computed from the actual Isaac Lab body masses, COM
-    velocities, COM positions, and world-frame inertia tensors.
+    Args:
+        env: 并行环境。
+        asset_cfg: 机器人及“右腿刚体在前、左腿刚体在后”的有序选择。
+        momentum_scale: 角动量归一化尺度 [kg*m^2/s]。
+
+    Returns:
+        非正成本，shape 为 ``[num_envs]``；Stand 环境经活动掩码后为零。
     """
 
     if momentum_scale <= 0.0:
@@ -915,10 +1264,8 @@ def leg_momentum_balance_reward(
     data = env.scene[asset_cfg.name].data
     total_z, body_momentum = _centroidal_angular_momentum_z(data)
     left_z, right_z = _side_momentum_z(body_momentum, asset_cfg)
-    # The paper writes the side term in mirrored local arm coordinates.  A
-    # sagittal mirror flips the left-side yaw sign, so its equivalent in the
-    # shared world frame is ``(-L_left,z - L_right,z)^2``: counter-rotating
-    # legs cancel instead of being penalized as excessive activity.
+    # 论文在镜像局部手臂坐标中写侧向项。矢状面对称会翻转左侧 yaw 符号，因此世界
+    # 系等价项为 (-L_left,z - L_right,z)^2，使反向转动的双腿相互抵消。
     mirrored_side_residual = -left_z - right_z
     residual = torch.square(total_z / momentum_scale) + 0.4 * torch.square(mirrored_side_residual / momentum_scale)
     score = -residual
@@ -930,12 +1277,18 @@ def leg_mechanical_power_penalty(
     asset_cfg: SceneEntityCfg,
     power_scale: float = 50.0,
 ):
-    """Penalize normalized lower-limb mechanical power [W].
+    """计算归一化下肢机械功率成本。
 
-    The paper's arm-swing energy term cannot be evaluated on this eight-DOF
-    mechanism.  ``|tau * qdot|`` over the actuated leg joints is its explicit
-    lower-body energy surrogate, routed only to moving gaits so that standing
-    support torque is not mistaken for inefficient swing.
+    八自由度机构没有论文中的手臂，故以执行腿关节的 ``|tau*qdot|`` [W] 作为明确的
+    下肢能耗代理。只在运动步态激活，避免把站立支撑力矩误认为低效摆动。
+
+    Args:
+        env: 并行环境。
+        asset_cfg: 机器人及需要统计的执行关节。
+        power_scale: 平均功率归一化尺度 [W]。
+
+    Returns:
+        截断到 ``[0, 10]`` 的正成本，shape 为 ``[num_envs]``；配置应使用负权重。
     """
 
     if power_scale <= 0.0:
@@ -960,7 +1313,18 @@ def leg_phase_symmetry_reward(
     activity_scale: float = 0.5,
     motion_scale: float = 0.2,
 ):
-    """Reward anti-phase left/right leg motion, replacing arm symmetry."""
+    """奖励左右腿反相运动，作为无手臂模型的对称性项。
+
+    Args:
+        env: 并行环境。
+        asset_cfg: 按右腿四关节、左腿四关节排列的实体配置。
+        sigma: 左右对应关节速度和的误差尺度 [rad/s]。
+        activity_scale: 关节活动量的饱和尺度 [rad/s]。
+        motion_scale: 正向运动门达到 1 的速度尺度 [m/s]。
+
+    Returns:
+        只在实际前进且处于运动步态时非零的奖励，shape 为 ``[num_envs]``。
+    """
 
     if sigma <= 0.0 or activity_scale <= 0.0:
         raise ValueError("sigma and activity_scale must be positive")
@@ -980,7 +1344,18 @@ def leg_amplitude_match_reward(
     activity_scale: float = 0.5,
     motion_scale: float = 0.2,
 ):
-    """Reward comparable left/right swing amplitudes without arm joints."""
+    """奖励左右腿具有接近的摆动速度幅值。
+
+    Args:
+        env: 并行环境。
+        asset_cfg: 按右腿四关节、左腿四关节排列的实体配置。
+        sigma: 左右幅值差的指数核尺度 [rad/s]。
+        activity_scale: 总活动量的饱和尺度 [rad/s]。
+        motion_scale: 正向运动门达到 1 的速度尺度 [m/s]。
+
+    Returns:
+        只在实际前进且处于运动步态时非零的奖励，shape 为 ``[num_envs]``。
+    """
 
     if sigma <= 0.0 or activity_scale <= 0.0:
         raise ValueError("sigma and activity_scale must be positive")
@@ -1001,14 +1376,22 @@ def phase_contact_reward(
     flight_window: float = 0.0,
     double_support_ramp_s: float = 0.0,
 ):
-    """Reward the contact pattern implied by the gait phase.
+    """奖励当前步态相位所要求的左右脚接触模式。
 
-    Walking keeps an exact single-support target.  A transition can opt into
-    double support, while running can reserve a small phase window for flight
-    (no foot contact), matching the paper's alternating support/flight pattern.
-    ``flight_window`` is a threshold on ``abs(sin(gait_phase))`` and must be in
-    ``[0, 1)``.  When ``double_support_ramp_s`` is positive, double-support
-    credit ramps from zero to one over that gait transition duration.
+    Walk 要求精确单脚支撑；过渡步态可允许双脚支撑；Run 可在支撑交换附近保留
+    短暂腾空窗口，从而表达论文中的支撑/腾空交替。``flight_window`` 是
+    ``abs(sin(gait_phase))`` 的阈值，范围必须是 ``[0, 1)``。
+
+    Args:
+        env: 并行环境。
+        gait: 本奖励对应的步态标签。
+        allow_double_support: 是否把双脚支撑视为可接受模式。
+        flight_window: Run 中允许双脚离地的相位正弦阈值。
+        double_support_ramp_s: 双支撑得分从零增加到一所需的过渡时间 [s]；零表示
+            立即允许。
+
+    Returns:
+        接触模式匹配分数，shape 为 ``[num_envs]``，并只在指定步态激活。
     """
 
     if not 0.0 <= flight_window < 1.0:
@@ -1023,8 +1406,8 @@ def phase_contact_reward(
     expected_left = phase_sine >= 0.0
     expected = torch.stack((expected_left, ~expected_left), dim=-1)
     single_support_match = torch.all(observed == expected, dim=-1).float()
-    # W2S may need a brief double-support landing to reshape contact timing.
-    # Walk remains exact single support by leaving this disabled.
+    # Walk-to-Stand 可能需要短暂双脚落地重整接触时序；Walk 不启用此选项，保持
+    # 精确单脚支撑目标。
     score = single_support_match
     if allow_double_support:
         double_support = torch.all(observed, dim=-1).to(score.dtype)
@@ -1035,16 +1418,15 @@ def phase_contact_reward(
         else:
             score = torch.maximum(score, double_support)
     if flight_window > 0.0:
-        # Run has a bounded flight interval around each support exchange.  Do
-        # not allow flight for other gaits merely because a caller typoed the
-        # optional parameter.
+        # 只有 Run 在支撑交换附近允许有界腾空；其他步态即使误传参数也必须报错，
+        # 不能悄悄改变其接触语义。
         if int(gait) != int(GaitMode.RUN):
             raise ValueError("flight_window is only valid for the RUN gait")
         flight_phase = phase_sine.abs() < flight_window
         flight_match = (~torch.any(observed, dim=-1)).to(score.dtype)
         score = torch.where(flight_phase, flight_match, score)
-    # A mean would give double support a constant 0.5 reward even though the
-    # walking target is single support. Exact matching avoids that shortcut.
+    # 若对左右脚匹配取平均，双脚支撑在单支撑目标下仍恒得 0.5，形成站住不走的
+    # 捷径；使用完整模式精确匹配可避免这一局部最优。
     return _masked(score, env, gait)
 
 
@@ -1054,7 +1436,17 @@ def swing_height_penalty(
     asset_cfg: SceneEntityCfg,
     target_height: float,
 ):
-    """Penalize swing-foot height error [m^2] for one gait."""
+    """计算指定步态中摆动脚高度误差成本。
+
+    Args:
+        env: 并行环境。
+        gait: 本项对应的步态。
+        asset_cfg: 按左脚、右脚选择足部刚体的配置。
+        target_height: 摆动脚世界 z 方向目标高度 [m]。
+
+    Returns:
+        仅对离地脚平均的高度平方误差 [m^2]，shape 为 ``[num_envs]``，其他步态为零。
+    """
 
     foot_pos = _as_tensor(env.scene[asset_cfg.name].data.body_link_pos_w)[:, asset_cfg.body_ids]
     left, right = _foot_contacts(env)
@@ -1065,7 +1457,17 @@ def swing_height_penalty(
 
 
 def straight_knee_reward(env, gait: GaitMode | int, asset_cfg: SceneEntityCfg, sigma: float = 0.35):
-    """Reward straight knees on the stance leg during the selected gait."""
+    """奖励指定步态中支撑腿膝关节接近伸直。
+
+    Args:
+        env: 并行环境。
+        gait: 本项对应的步态。
+        asset_cfg: 必须按右膝、左膝选择两个关节。
+        sigma: 解剖学屈曲角误差尺度 [rad]。
+
+    Returns:
+        支撑腿伸直相似度，shape 为 ``[num_envs]``；无支撑脚或其他步态时为零。
+    """
 
     joint_pos = _as_tensor(env.scene[asset_cfg.name].data.joint_pos)[:, asset_cfg.joint_ids]
     if joint_pos.shape[-1] != 2:
@@ -1086,12 +1488,25 @@ def straight_knee_reward(env, gait: GaitMode | int, asset_cfg: SceneEntityCfg, s
     return _masked(score, env, gait)
 
 
-def _knee_joint_names(asset_cfg: SceneEntityCfg) -> tuple[str, ...]:
-    """Return the explicit knee order used by a manager term.
+# -----------------------------------------------------------------------------
+# 膝关节安全与分步态专属奖励
+# -----------------------------------------------------------------------------
 
-    Isaac Lab resolves ``joint_ids`` during scene construction, but preserving
-    the names here lets safety terms apply side-specific bounds even when the
-    backend's internal joint order changes.
+
+def _knee_joint_names(asset_cfg: SceneEntityCfg) -> tuple[str, ...]:
+    """取得管理器项显式声明的“右膝、左膝”关节顺序。
+
+    Isaac Lab 在创建场景时解析 ``joint_ids``，但这里仍保留名称，以便仿真后端内部
+    顺序改变时，安全项仍能把左右侧不同边界应用到正确膝关节。
+
+    Args:
+        asset_cfg: 包含 ``joint_names`` 的场景实体配置。
+
+    Returns:
+        固定为 ``KNEE_JOINT_NAMES`` 的二元素元组。
+
+    Raises:
+        ValueError: 名称缺失、数量错误或顺序不是右膝后左膝。
     """
 
     names = getattr(asset_cfg, "joint_names", None)
@@ -1103,8 +1518,7 @@ def _knee_joint_names(asset_cfg: SceneEntityCfg) -> tuple[str, ...]:
         names = tuple(names)
     if tuple(names) != KNEE_JOINT_NAMES:
         raise ValueError(
-            "knee terms require joint_names=['Rthigh_to_Rleg', 'Lthigh_to_Lleg'] "
-            f"in that order, got {tuple(names)!r}"
+            f"knee terms require joint_names=['Rthigh_to_Rleg', 'Lthigh_to_Lleg'] in that order, got {tuple(names)!r}"
         )
     return tuple(names)
 
@@ -1117,7 +1531,25 @@ def _knee_bound_tensors(
     lower: float | None = None,
     upper: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resolve per-side raw articulation bounds on the requested device."""
+    """解析左右膝在原始 articulation 坐标中的独立边界。
+
+    Args:
+        asset_cfg: 必须按右膝、左膝声明关节名的实体配置。
+        device: 输出边界张量所在设备。
+        dtype: 输出浮点类型。
+        bounds_by_joint: 可选“关节名 -> (下界, 上界)”映射，单位 [rad]。
+        lower: 兼容旧配置的统一下界 [rad]，必须与 ``upper`` 同时传入。
+        upper: 兼容旧配置的统一上界 [rad]，必须与 ``lower`` 同时传入。
+
+    Returns:
+        ``(下界, 上界)``，每项 shape 为 ``[2]``，顺序为右膝、左膝。
+
+    Raises:
+        ValueError: 只传一个统一边界、缺少某侧边界，或下界不小于上界。
+
+    Notes:
+        左右膝原始轴方向互为镜像，正式配置应优先使用逐关节边界，而不是统一范围。
+    """
 
     names = _knee_joint_names(asset_cfg)
     if bounds_by_joint is None:
@@ -1145,12 +1577,22 @@ def knee_limit_penalty(
     lower: float | None = None,
     upper: float | None = None,
 ):
-    """Return a positive squared cost for knee angles outside human limits.
+    """计算膝角超出人体范围的正平方成本。
 
-    The manager applies a negative weight to this term.  Bounds are expressed
-    in the raw articulation convention.  Right and left knees have mirrored
-    axes, so a single global ``min/max`` interval would incorrectly allow a
-    reverse-bent knee on one side.
+    Args:
+        env: 并行环境。
+        asset_cfg: 按右膝、左膝选择关节的实体配置。
+        bounds_by_joint: 可选逐关节原始角度边界 [rad]。
+        lower: 兼容旧配置的统一下界 [rad]。
+        upper: 兼容旧配置的统一上界 [rad]。
+
+    Returns:
+        越界距离平方和 [rad^2]，shape 为 ``[num_envs]``；范围内为零。奖励管理器
+        使用负权重把它转换为惩罚。
+
+    Notes:
+        边界采用原始 articulation 符号。左右膝轴互为镜像，单一全局区间可能错误
+        地允许其中一侧反向弯曲。
     """
 
     joint_pos = _as_tensor(env.scene[asset_cfg.name].data.joint_pos)[:, asset_cfg.joint_ids]
@@ -1169,15 +1611,17 @@ def knee_out_of_human_range(
     lower: float | None = None,
     upper: float | None = None,
 ):
-    """Terminate environments whose raw knee angles leave their side bounds."""
+    """标记任一膝关节离开对应人体边界的环境。
+
+    Returns:
+        布尔终止掩码，shape 为 ``[num_envs]``；任一侧越界即为 ``True``。
+    """
 
     joint_pos = _as_tensor(env.scene[asset_cfg.name].data.joint_pos)[:, asset_cfg.joint_ids]
     lower_tensor, upper_tensor = _knee_bound_tensors(
         asset_cfg, joint_pos.device, joint_pos.dtype, bounds_by_joint, lower, upper
     )
-    return torch.any(
-        (joint_pos < lower_tensor.unsqueeze(0)) | (joint_pos > upper_tensor.unsqueeze(0)), dim=-1
-    )
+    return torch.any((joint_pos < lower_tensor.unsqueeze(0)) | (joint_pos > upper_tensor.unsqueeze(0)), dim=-1)
 
 
 def knee_velocity_limit_penalty(
@@ -1185,7 +1629,16 @@ def knee_velocity_limit_penalty(
     asset_cfg: SceneEntityCfg,
     max_velocity: float = 3.14,
 ):
-    """Penalize knee speeds above the configured actuator safety limit."""
+    """计算膝关节角速度超过执行器安全阈值的平方成本。
+
+    Args:
+        env: 并行环境。
+        asset_cfg: 需要检查的膝关节选择。
+        max_velocity: 允许的角速度绝对值上限 [rad/s]，必须为正。
+
+    Returns:
+        超限部分平方和 [(rad/s)^2]，shape 为 ``[num_envs]``。
+    """
 
     if max_velocity <= 0.0:
         raise ValueError("max_velocity must be positive")
@@ -1203,20 +1656,30 @@ def human_knee_gait_reward(
     stance_sigma: float = 0.30,
     swing_sigma: float = 0.45,
 ):
-    """Reward physiological stance extension and swing flexion.
+    """奖励支撑腿生理伸展和摆动腿生理屈曲。
 
-    ``asset_cfg`` must contain knees in right/left order.  Contact labels are
-    read in the same order and are deliberately detached from the sign of the
-    raw joint angle.  This prevents PPO from receiving a positive score for a
-    reverse-bent knee while still allowing flexion during the swing phase.
+    Args:
+        env: 并行环境。
+        gait: 本奖励对应的运动步态。
+        asset_cfg: 必须按右膝、左膝包含两个关节。
+        stance_target: 支撑期目标解剖学屈曲角 [rad]。
+        swing_target: 摆动期目标解剖学屈曲角 [rad]。
+        stance_sigma: 支撑期误差尺度 [rad]。
+        swing_sigma: 摆动期误差尺度 [rad]。
+
+    Returns:
+        左右膝平均相似度，shape 为 ``[num_envs]``，只在指定 gait 激活。
+
+    Notes:
+        接触标签与原始关节角符号分开处理，再用显式左右符号转成解剖学屈曲角。
+        这可防止反向弯膝也拿到正分，同时允许摆动期正常屈膝。
     """
 
     names = _knee_joint_names(asset_cfg)
     joint_pos = _as_tensor(env.scene[asset_cfg.name].data.joint_pos)[:, asset_cfg.joint_ids]
     if joint_pos.shape[-1] != 2:
         raise ValueError("human_knee_gait_reward requires ordered right and left knee joints")
-    # Convert raw articulation angles to anatomical flexion angles.  The
-    # explicit signs are kept here rather than inferred from a tensor order.
+    # 用显式左右符号把原始 articulation 角转换为解剖学屈曲角，不从张量位置猜方向。
     signs = torch.as_tensor(
         [KNEE_ARTICULATION_SIGNS[name] for name in names],
         device=joint_pos.device,
@@ -1232,12 +1695,21 @@ def human_knee_gait_reward(
     stance_score = torch.exp(-torch.square(flexion - float(stance_target)) / (float(stance_sigma) ** 2))
     swing_score = torch.exp(-torch.square(flexion - float(swing_target)) / (float(swing_sigma) ** 2))
     score = torch.where(contact, stance_score, swing_score).mean(dim=-1)
-    # Do not shape the static stand gait with a walking knee-phase term.
+    # 步行膝相位奖励不能影响静态 Stand；_masked 只给目标运动步态计分。
     return _masked(score, env, gait)
 
 
 def foot_drag_penalty(env, gait: GaitMode | int, asset_cfg: SceneEntityCfg):
-    """Penalize horizontal foot speed while a foot is in contact."""
+    """计算脚着地时仍发生水平滑动的拖脚成本。
+
+    Args:
+        env: 并行环境。
+        gait: 本项对应的步态。
+        asset_cfg: 按左脚、右脚选择足部刚体的配置。
+
+    Returns:
+        着地脚水平速度幅值之和 [m/s]，shape 为 ``[num_envs]``，其他步态为零。
+    """
 
     foot_vel = _as_tensor(env.scene[asset_cfg.name].data.body_lin_vel_w)[:, asset_cfg.body_ids, :2]
     left, right = _foot_contacts(env)
@@ -1247,7 +1719,11 @@ def foot_drag_penalty(env, gait: GaitMode | int, asset_cfg: SceneEntityCfg):
 
 
 def double_support_reward(env):
-    """Reward simultaneous left/right contact while standing."""
+    """奖励 Stand 时左右脚同时有效接触地面。
+
+    Returns:
+        双脚支撑二值奖励，shape 为 ``[num_envs]``；非 Stand 环境为零。
+    """
 
     left, right = _foot_contacts(env)
     score = ((left > CONTACT_FORCE_THRESHOLD_N) & (right > CONTACT_FORCE_THRESHOLD_N)).float()
@@ -1255,7 +1731,15 @@ def double_support_reward(env):
 
 
 def standing_base_stillness_reward(env, sigma: float = 0.2):
-    """Reward low base velocity while standing."""
+    """奖励 Stand 时机身线速度和角速度接近零。
+
+    Args:
+        env: 并行环境。
+        sigma: 合成速度平方的指数衰减尺度。
+
+    Returns:
+        静止相似度，shape 为 ``[num_envs]``，非 Stand 环境为零。
+    """
 
     lin, ang, _ = _base(env)
     motion = torch.sum(torch.square(lin), dim=-1) + torch.sum(torch.square(ang), dim=-1)
@@ -1263,7 +1747,15 @@ def standing_base_stillness_reward(env, sigma: float = 0.2):
 
 
 def standing_pose_reward(env, sigma: float = 0.35):
-    """Reward the default joint pose while standing."""
+    """奖励 Stand 时八关节保持默认姿态。
+
+    Args:
+        env: 并行环境。
+        sigma: 关节角均方误差的尺度 [rad]。
+
+    Returns:
+        默认姿态相似度，shape 为 ``[num_envs]``，非 Stand 环境为零。
+    """
 
     data = env.scene["robot"].data
     error = _canonical_joint_tensor(env, data.joint_pos) - _canonical_joint_tensor(env, data.default_joint_pos)
@@ -1272,7 +1764,15 @@ def standing_pose_reward(env, sigma: float = 0.35):
 
 
 def standing_upright_reward(env, sigma: float = 0.2):
-    """Reward level roll and pitch while standing."""
+    """奖励 Stand 时机身滚转和俯仰角接近水平。
+
+    Args:
+        env: 并行环境。
+        sigma: 姿态角误差尺度 [rad]。
+
+    Returns:
+        直立相似度，shape 为 ``[num_envs]``，非 Stand 环境为零。
+    """
 
     roll, pitch, _ = euler_xyz_from_quat(_base(env)[2])
     score = torch.exp(-(torch.square(roll) + torch.square(pitch)) / (sigma * sigma))
@@ -1280,7 +1780,16 @@ def standing_upright_reward(env, sigma: float = 0.2):
 
 
 def standing_foot_flatness_reward(env, asset_cfg: SceneEntityCfg, sigma: float = 0.2):
-    """Reward flat feet while standing, ignoring foot yaw."""
+    """奖励 Stand 时双脚水平贴地，同时忽略脚的偏航方向。
+
+    Args:
+        env: 并行环境。
+        asset_cfg: 选择左右脚刚体的配置。
+        sigma: 去除 yaw 后的脚倾斜误差尺度。
+
+    Returns:
+        双脚平整度相似度，shape 为 ``[num_envs]``，非 Stand 环境为零。
+    """
 
     foot_quat = _as_tensor(env.scene[asset_cfg.name].data.body_link_quat_w)[:, asset_cfg.body_ids]
     yaw = math_utils.yaw_quat(foot_quat.reshape(-1, 4)).reshape_as(foot_quat)
@@ -1290,7 +1799,16 @@ def standing_foot_flatness_reward(env, asset_cfg: SceneEntityCfg, sigma: float =
 
 
 def standing_feet_alignment_reward(env, asset_cfg: SceneEntityCfg, sigma: float = 0.2):
-    """Reward both feet sharing the root yaw direction while standing."""
+    """奖励 Stand 时双脚偏航方向与机身根节点一致。
+
+    Args:
+        env: 并行环境。
+        asset_cfg: 选择机器人和左右脚刚体的配置。
+        sigma: 相对偏航误差尺度。
+
+    Returns:
+        双脚朝向相似度，shape 为 ``[num_envs]``，非 Stand 环境为零。
+    """
 
     foot_quat = _as_tensor(env.scene[asset_cfg.name].data.body_link_quat_w)[:, asset_cfg.body_ids]
     root_quat = _as_tensor(env.scene[asset_cfg.name].data.root_quat_w)
@@ -1301,7 +1819,15 @@ def standing_feet_alignment_reward(env, asset_cfg: SceneEntityCfg, sigma: float 
 
 
 def standing_joint_stillness_reward(env, sigma: float = 0.25):
-    """Reward low joint speed while standing."""
+    """奖励 Stand 时八关节角速度接近零。
+
+    Args:
+        env: 并行环境。
+        sigma: 关节角速度均方误差尺度 [rad/s]。
+
+    Returns:
+        关节静止相似度，shape 为 ``[num_envs]``，非 Stand 环境为零。
+    """
 
     joint_vel = _canonical_joint_tensor(env, env.scene["robot"].data.joint_vel)
     score = torch.exp(-torch.mean(torch.square(joint_vel), dim=-1) / (sigma * sigma))
@@ -1309,7 +1835,16 @@ def standing_joint_stillness_reward(env, sigma: float = 0.25):
 
 
 def smooth_slowdown_reward(env, gait: GaitMode | int, scale: float = 0.2):
-    """Reward a bounded reduction in planar speed during a transition."""
+    """奖励过渡步态中相邻状态的平面速度平稳下降。
+
+    Args:
+        env: 并行环境。
+        gait: 应激活该奖励的过渡步态。
+        scale: 速度下降映射到满分的尺度 [m/s]。
+
+    Returns:
+        ``[0, 1]`` 的减速分数，shape 为 ``[num_envs]``，其他步态为零。
+    """
 
     current = torch.linalg.vector_norm(_base(env)[0][:, :2], dim=-1)
     previous = _gait_command(env).previous_speed
@@ -1318,7 +1853,16 @@ def smooth_slowdown_reward(env, gait: GaitMode | int, scale: float = 0.2):
 
 
 def short_contact_reward(env, max_contact_time: float = 0.25):
-    """Reward brief stance periods while running."""
+    """奖励 Run 中较短的单脚接触持续时间。
+
+    Args:
+        env: 并行环境。
+        max_contact_time: 接触时间指数衰减尺度 [s]。
+
+    Returns:
+        当前着地脚的短接触平均分，shape 为 ``[num_envs]``；非 Run 环境为零。
+        接触传感器关闭时直接返回全零。
+    """
 
     if not _optional_sensor_enabled(env, "contact"):
         return torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
@@ -1337,7 +1881,16 @@ def short_contact_reward(env, max_contact_time: float = 0.25):
 
 
 def push_off_reward(env, asset_cfg: SceneEntityCfg):
-    """Reward stance-ankle power that creates forward and upward foot motion."""
+    """奖励单脚支撑时踝关节功率带来的向前/向上蹬伸。
+
+    Args:
+        env: 并行环境。
+        asset_cfg: 关节必须按右踝、左踝排列的实体配置。
+
+    Returns:
+        踝功率与机身正向/向上运动的有界乘积，shape 为 ``[num_envs]``；只在 Run
+        且恰好单脚支撑时非零。
+    """
 
     robot = env.scene[asset_cfg.name]
     ankle_speed = torch.abs(_as_tensor(robot.data.joint_vel)[:, asset_cfg.joint_ids])
@@ -1348,7 +1901,7 @@ def push_off_reward(env, asset_cfg: SceneEntityCfg):
         effort = torch.zeros_like(_as_tensor(robot.data.joint_vel))
     ankle_effort = torch.abs(_as_tensor(effort)[:, asset_cfg.joint_ids])
     left, right = _foot_contacts(env)
-    # Joint IDs are ordered [right ankle, left ankle].
+    # 关节下标顺序固定为 [右踝, 左踝]，接触张量必须使用同一顺序。
     stance = torch.stack((right > CONTACT_FORCE_THRESHOLD_N, left > CONTACT_FORCE_THRESHOLD_N), dim=-1).float()
     single_support = (stance.sum(dim=-1) == 1.0).float()
     ankle_power = torch.sum(ankle_speed * ankle_effort * stance, dim=-1) / stance.sum(dim=-1).clamp(min=1.0)
@@ -1359,14 +1912,32 @@ def push_off_reward(env, asset_cfg: SceneEntityCfg):
 
 
 def forward_velocity_reward(env, gait: GaitMode | int, scale: float = 4.0):
-    """Reward bounded positive forward velocity for a selected gait."""
+    """奖励指定步态中的正向速度，并把结果限制到 ``[0, 1]``。
+
+    Args:
+        env: 并行环境。
+        gait: 应激活本奖励的步态。
+        scale: 达到满分的正向速度 [m/s]。
+
+    Returns:
+        有界正向速度分数，shape 为 ``[num_envs]``。
+    """
 
     score = torch.clamp(_base(env)[0][:, 0] / scale, min=0.0, max=1.0)
     return _masked(score, env, gait)
 
 
 def transition_to_walk_speed_reward(env, target_speed: float = 0.2, std: float = 0.3):
-    """Reward convergence to walking speed during run-to-walk."""
+    """奖励 Run-to-Walk 过渡收敛到目标走路速度。
+
+    Args:
+        env: 并行环境。
+        target_speed: 过渡结束时的正向目标速度 [m/s]。
+        std: 速度误差指数核尺度 [m/s]。
+
+    Returns:
+        速度相似度，shape 为 ``[num_envs]``；非 Run-to-Walk 环境为零。
+    """
 
     error = torch.square(_base(env)[0][:, 0] - target_speed)
     return _masked(torch.exp(-error / (std * std)), env, GaitMode.RUN_TO_WALK)
@@ -1382,10 +1953,24 @@ def advance_exoskeleton_curriculum(
     multi_gait_max_speed: float,
     step_offset: int = 0,
 ):
-    """Advance command ranges through walk, transition, and multi-gait phases.
+    """按全局控制步推进 Walk、Transitions 和 Multi-gait 三阶段课程。
 
-    ``step_offset`` lets a resumed RL-Games run restore curriculum progress;
-    RL-Games checkpoints do not serialize ``env.common_step_counter``.
+    Args:
+        env: 带 ``common_step_counter`` 和步态命令项的环境。
+        env_ids: Isaac Lab 课程管理器传入的环境下标；阶段是全局的，因此不使用。
+        phase2_start: 进入 Transitions 阶段的全局控制步。
+        phase3_start: 进入 Multi-gait 阶段的全局控制步。
+        walk_speed: 第一阶段及后续阶段的最小前进速度 [m/s]。
+        transition_max_speed: 第二阶段最大前进速度 [m/s]。
+        multi_gait_max_speed: 第三阶段最大前进速度 [m/s]。
+        step_offset: 恢复训练时补回的已完成控制步，必须非负。
+
+    Returns:
+        TensorBoard 可记录的阶段、控制步、当前最大命令速度和 Froude 阈值字典。
+
+    Notes:
+        RL-Games checkpoint 不序列化 ``env.common_step_counter``，因此从旧 checkpoint
+        恢复时必须显式设置 ``step_offset``，否则课程会错误地从第一阶段重新开始。
     """
 
     del env_ids

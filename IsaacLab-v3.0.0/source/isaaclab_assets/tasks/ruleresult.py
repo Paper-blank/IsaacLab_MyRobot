@@ -3,15 +3,19 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Structured joint trajectory output for exoskeleton policy playback.
+"""把策略回放转换为结构化关节轨迹输出。
 
-The PPO actor still controls eight position targets.  This module turns those
-targets into a 24-value trajectory result, uses the selected sample clock for
-non-uniform finite differences, and keeps the measured articulation state next
-to it for validation.  Optional future sequences are explicitly labeled as
-kinematic extrapolations or externally supplied targets; no extra actor head is
-assumed.  It deliberately lives outside the action term so existing
-checkpoints remain compatible.
+重要前提：当前 PPO actor 仍只输出 8 个归一化动作。本模块在环境完成一步之后读取 8 个
+处理后的目标角度，再结合相邻采样时间计算目标速度和角加速度，形成 24 个物理量；它
+没有把旧 checkpoint 的网络输出层偷偷改成 24 维。
+
+RuleresultRecorderMixin 被基础环境和模仿环境共同继承。每次 env.step 后，它按固定
+公共关节顺序生成记录，可写为可读 JSONL，或经过标定与安全检查后写成 55AA 二进制
+帧。measured 字段是仿真实际反馈，target 字段才是策略目标，二者不能混用。
+
+时间模式可以使用仿真时间、墙钟时间或固定配置间隔。非固定间隔差分必须使用相邻记录
+的真实 dt；reset 时必须清空历史，避免把新 episode 第一帧减去旧 episode 末帧。
+未来 kinematic 序列只是运动学外推，supplied 才表示外部真正提供的未来目标。
 """
 
 from __future__ import annotations
@@ -30,6 +34,8 @@ from isaaclab_assets.tasks.protocol_55aa import Protocol55AAConfig
 from isaaclab_assets.tasks.robot_contract import ACTUATED_JOINT_NAMES, CONTROL_DT_S
 
 RULERESULT_SCHEMA = "ruleresult/v1"
+# 结果按字段分组排列：8 个角度 + 8 个速度 + 8 个角加速度 = 24，而不是每个关节
+# 连续放 q/v/a。JSONL 还会保存字段名，因此比裸 24 维张量更适合人工检查。
 RULERESULT_DIM = 3 * len(ACTUATED_JOINT_NAMES)
 RULERESULT_OUTPUT_FORMATS = ("jsonl", "protocol_55aa")
 RULERESULT_TIME_MODES = ("simulation", "wall_clock", "configured")
@@ -37,14 +43,19 @@ RULERESULT_PREDICTION_MODES = ("none", "kinematic", "supplied")
 
 
 def _as_tensor(value: Any) -> torch.Tensor:
-    """Return a detached Torch view for native or wrapped simulation data."""
+    """把普通张量或 Isaac Lab 代理数组统一转换为 Torch 张量视图。"""
 
     value = value.torch if hasattr(value, "torch") else value
     return torch.as_tensor(value)
 
 
 def _reorder_joint_tensor(value: torch.Tensor, names: Sequence[str]) -> torch.Tensor:
-    """Reorder a final joint dimension to the public canonical joint order."""
+    """按公共 8 关节约定重排张量最后一维。
+
+    输入可以带任意前导批量维，例如 ``[N, 8]`` 或 ``[N, H, 8]``；只有最后的关节维
+    会重排。这样即使 USD、动作项和导出协议使用不同内部顺序，公开结果仍能稳定按
+    :data:`ACTUATED_JOINT_NAMES` 解释。
+    """
 
     if value.ndim < 1 or value.shape[-1] != len(names):
         raise ValueError(f"expected a final dimension of {len(names)}, got {tuple(value.shape)}")
@@ -67,25 +78,22 @@ def derive_target_kinematics(
     dt_s: float = CONTROL_DT_S,
     previous_dt_s: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Differentiate position targets using the interval between samples.
+    """根据相邻目标角和实际采样间隔计算目标速度、目标角加速度。
+
+    使用后向差分 ``v[t]=(q[t]-q[t-1])/dt[t]``。当本次与上次间隔不同，角加速度
+    使用两段间隔的中点 ``0.5*(dt[t]+dt[t-1])``，避免把运行卡顿或调度抖动错误地
+    当成固定 20 ms。该函数计算的是“目标轨迹导数”，不是电机反馈导数。
 
     Args:
-        angle_target_rad: Position targets with shape ``[..., 8]`` [rad].
-        previous_angle_target_rad: Targets from the previous control step.
-            ``None`` initializes the first velocity to zero.
-        previous_velocity_rad_s: Velocity estimate from the previous control
-            step. ``None`` initializes the first acceleration to zero.
-        dt_s: Interval from the previous sample to this sample [s].
-        previous_dt_s: Previous sample interval [s].  When supplied, the
-            acceleration uses the midpoint interval
-            ``0.5 * (dt_s + previous_dt_s)`` so jitter does not get hidden by
-            a fixed control period.  Omitting it preserves the old backward
-            difference ``(v[t] - v[t-1]) / dt_s``.
+        angle_target_rad: 当前目标角 [rad]，形状 ``[..., 8]``。
+        previous_angle_target_rad: 上一控制步目标角；``None`` 表示没有可用历史。
+        previous_velocity_rad_s: 上一步目标速度 [rad/s]；``None`` 表示不能计算加速度。
+        dt_s: 从上一次样本到当前样本的间隔 [s]。
+        previous_dt_s: 再前一段采样间隔 [s]；提供时用于非均匀加速度差分。
 
     Returns:
-        ``(velocity_rad_s, acceleration_rad_s2)`` with the same shape as the
-        input. The first sample after reset is explicitly zero for both
-        derivatives.
+        ``(目标速度 [rad/s], 目标角加速度 [rad/s^2])``，形状与输入相同。reset 后
+        第一帧没有前一帧可比较，两种导数明确返回零，不能把旧 episode 末帧当历史。
     """
 
     if not math.isfinite(float(dt_s)) or dt_s <= 0.0:
@@ -109,8 +117,7 @@ def derive_target_kinematics(
             raise ValueError(f"previous angle shape {tuple(previous_angle.shape)} != {tuple(angle.shape)}")
         velocity = (angle - previous_angle) / dt_s
 
-    # There is no meaningful acceleration on the first sample after reset.
-    # Explicitly zero it even when a stale previous velocity was supplied.
+    # reset 后第一帧没有有意义的加速度；即便调用方误传了旧速度，也明确输出零。
     if not has_previous_angle or previous_velocity_rad_s is None:
         acceleration = torch.zeros_like(angle)
     else:
@@ -131,7 +138,11 @@ def _prediction_timestamps(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Normalize a uniform or per-batch future timestamp array."""
+    """把未来相对时间统一为形状 ``[N, H]`` 的严格递增张量 [s]。
+
+    ``N`` 是并行环境数，``H`` 是未来步数。调用者既可以给所有环境共用的 ``[H]``，
+    也可以给每个环境不同的 ``[N, H]``；未提供时按固定 ``dt_s`` 生成。
+    """
 
     if horizon <= 0:
         raise ValueError(f"horizon must be positive, got {horizon}")
@@ -168,29 +179,24 @@ def predict_ruleresult_sequence(
     dt_s: float = CONTROL_DT_S,
     initial_velocity_rad_s: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Differentiate a future joint-target sequence with non-uniform timing.
+    """按非均匀未来时间戳对一段已提供的目标角序列求导。
 
-    This helper does not call a policy or a simulator.  It accepts a sequence
-    that was supplied by a policy rollout, planner, or dataset and computes
-    finite differences using each actual future timestamp.  Input shape is
-    ``[H, 8]`` or ``[N, H, 8]``; output tensors retain the corresponding rank.
+    本函数不会调用策略，也不会向前运行仿真。它只接收由外部规划器、策略 rollout 或
+    数据集已经给出的未来角度，再按每段真实时间差计算速度和加速度。因此结果可称为
+    “已提供序列的导数”，不能宣称 PPO 自己预测了未来。输入为 ``[H, 8]`` 或
+    ``[N, H, 8]``，输出保持同样是否带批量维的形式。
 
     Args:
-        angle_targets_rad: Future position targets [rad].
-        timestamps_s: Future timestamps relative to the current sample [s].
-            Shape ``[H]`` or ``[N, H]``.  If omitted, samples are uniformly
-            spaced by ``dt_s``.
-        dt_s: Fallback uniform prediction interval [s].
-        initial_velocity_rad_s: Optional velocity at the current sample [rad/s],
-            shape ``[8]`` or ``[N, 8]``.  Without it, the first predicted
-            velocity is initialized to zero.
+        angle_targets_rad: 未来位置目标 [rad]，形状 ``[H, 8]`` 或 ``[N, H, 8]``。
+        timestamps_s: 相对当前时刻的未来时间 [s]，形状 ``[H]`` 或 ``[N, H]``。
+            省略时用 ``dt_s`` 生成均匀时间轴。
+        dt_s: 未提供时间戳时使用的固定未来间隔 [s]。
+        initial_velocity_rad_s: 当前边界速度 [rad/s]，形状 ``[8]`` 或 ``[N, 8]``。
 
     Returns:
-        A dictionary containing ``angles``, ``velocities``,
-        ``accelerations``, ``timestamps_s``, ``dt_s``, and ``valid_mask``.
-        ``valid_mask`` is false for the first derivative sample because no
-        preceding future target exists.  When an initial velocity is supplied,
-        it is used as that first sample's boundary velocity.
+        含 ``angles``、``velocities``、``accelerations``、``timestamps_s``、
+        ``dt_s`` 和 ``valid_mask`` 的字典。第一未来点之前没有另一未来目标，所以其
+        差分有效标记为假；若给出初始速度，它只作为求后续加速度的边界条件。
     """
 
     angle = _as_tensor(angle_targets_rad).detach()
@@ -273,12 +279,12 @@ def extrapolate_ruleresult_sequence(
     horizon_steps: int,
     dt_s: float = CONTROL_DT_S,
 ) -> dict[str, torch.Tensor]:
-    """Create a labeled constant-acceleration future trajectory.
+    """用当前状态生成带明确标签的恒加速度未来轨迹。
 
-    This is a kinematic extrapolation from the latest measured/planned state,
-    not a claim that the PPO actor predicted future observations or actions.
-    Input tensors have shape ``[8]`` or ``[N, 8]`` and outputs have shape
-    ``[H, 8]`` or ``[N, H, 8]`` respectively.
+    公式是纯运动学 ``q=q0+v0*t+0.5*a*t^2``、``v=v0+a*t``。它只是把最新目标状态
+    向未来外推，不读取未来观测，也不等价于 PPO actor 连续推理。因此 JSON 中会标为
+    ``constant_acceleration_extrapolation``。输入形状为 ``[8]`` 或 ``[N, 8]``，输出
+    形状为 ``[H, 8]`` 或 ``[N, H, 8]``，单位分别为 rad、rad/s、rad/s^2。
     """
 
     if horizon_steps <= 0:
@@ -323,7 +329,7 @@ def extrapolate_ruleresult_sequence(
 def flatten_ruleresult(
     angle_rad: torch.Tensor, velocity_rad_s: torch.Tensor, angular_acceleration_rad_s2: torch.Tensor
 ) -> torch.Tensor:
-    """Return field-major ``[..., 24]`` output: angle, velocity, acceleration."""
+    """按字段拼成 ``[..., 24]``：先8角度，再8速度，最后8角加速度。"""
 
     tensors = tuple(_as_tensor(value) for value in (angle_rad, velocity_rad_s, angular_acceleration_rad_s2))
     expected = tensors[0].shape
@@ -333,7 +339,7 @@ def flatten_ruleresult(
 
 
 def _vector_list(value: torch.Tensor) -> list[float]:
-    """Convert one finite joint vector to JSON-safe floats."""
+    """把一个有限 ``[8]`` 关节向量转换为可写入 JSON 的 Python 浮点列表。"""
 
     value = _as_tensor(value).detach().float().reshape(-1)
     if value.numel() != len(ACTUATED_JOINT_NAMES):
@@ -344,7 +350,7 @@ def _vector_list(value: torch.Tensor) -> list[float]:
 
 
 def _sequence_lists(value: torch.Tensor, *, joint_count: int = len(ACTUATED_JOINT_NAMES)) -> list[list[float]]:
-    """Convert a ``[H, joints]`` tensor to JSON-safe nested lists."""
+    """把 ``[H, 8]`` 未来序列转换为 JSON 可序列化的二维列表。"""
 
     tensor = _as_tensor(value).detach().float()
     if tensor.ndim != 2 or tensor.shape[-1] != joint_count:
@@ -355,7 +361,11 @@ def _sequence_lists(value: torch.Tensor, *, joint_count: int = len(ACTUATED_JOIN
 
 
 def _prediction_record(prediction: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a prediction dictionary for the JSONL schema."""
+    """校验一段未来序列，并转换成 JSONL 中统一的 prediction 对象。
+
+    该层要求角度、速度、加速度均为 ``[H, 8]``，相对时间为严格递增的 ``[H]``。
+    ``source`` 会保留未来序列来源，使读取者能区分恒加速度外推和外部真实提供的目标。
+    """
 
     required = ("angles", "velocities", "accelerations")
     missing = [key for key in required if key not in prediction]
@@ -436,7 +446,17 @@ def build_ruleresult_record(
     prediction_status: str | None = None,
     derivative_history_valid: bool = True,
 ) -> dict[str, Any]:
-    """Build one JSON-safe, self-describing result row."""
+    """构造一行可直接写入 JSONL、且带单位和上下文的结果记录。
+
+    ``angle_rad``、``velocity_rad_s``、``angular_acceleration_rad_s2`` 是策略位置目标及
+    其导数；``measured_*`` 是仿真关节实际反馈。二者并列保存便于分析跟踪误差，但
+    55AA 输出只编码目标字段。``sample_dt_s`` 是本次差分实际采用的间隔，
+    ``control_dt_s`` 是标称策略周期，``output_dt_s`` 则是相邻落盘记录间隔；当
+    ``ruleresult_interval > 1`` 时三者不会相等。
+
+    每个关节向量形状为 ``[8]``，单位写在字段名中。``prediction`` 可选，不提供未来
+    目标时当前样本仍是完整有效的 ruleresult。
+    """
 
     if step < 0 or env_id < 0 or episode < 0:
         raise ValueError("step, env_id, and episode must be non-negative")
@@ -459,8 +479,8 @@ def build_ruleresult_record(
         "episode": int(episode),
         "env_id": int(env_id),
         "timestamp_s": float(timestamp_s),
-        # ``dt_s`` is retained as a v1 alias for the interval used by the
-        # derivative calculation.  New consumers should use sample_dt_s.
+        # ``dt_s`` 是为兼容 v1 保留的别名，表示导数计算使用的采样间隔。
+        # 新的读取程序应改用 ``sample_dt_s``。
         "dt_s": float(dt_s),
         "control_dt_s": float(control_dt_s),
         "sample_dt_s": float(dt_s),
@@ -496,10 +516,19 @@ def build_ruleresult_record(
 
 
 class RuleresultRecorderMixin:
-    """Add optional per-step ruleresult output to a manager-based RL env."""
+    """给 ManagerBasedRLEnv 增加可选的逐步关节结果记录能力。
+
+    这是 mixin（混入类），不单独创建环境。基础环境和模仿环境把它放在继承列表前面，
+    因而可以拦截 reset、保存终止瞬间状态，并在正常 ``env.step`` 完成后生成输出。
+    配置未启用 ``ruleresult_enabled`` 时所有记录路径都会快速返回，不影响训练动作维度。
+    """
 
     def _ruleresult_init(self) -> None:
-        """Initialize lazy recorder state after the base environment exists."""
+        """在基础环境已经存在后，按需初始化记录器缓存、计数器和文件句柄。
+
+        延迟初始化让 mixin 不必修改环境构造函数，也避免只训练不导出时提前创建文件。
+        ``previous_*`` 保存差分历史；``pending_*`` 暂存即将 reset 的终止帧。
+        """
 
         if getattr(self, "_ruleresult_initialized", False):
             return
@@ -512,9 +541,8 @@ class RuleresultRecorderMixin:
         self._ruleresult_previous_timestamp = None
         self._ruleresult_previous_output_timestamp = None
         self._ruleresult_history_valid = None
-        # ManagerBasedRLEnv resets terminated environments inside ``step``.
-        # Keep a one-step cache so the terminal sample can be emitted before
-        # the reset state replaces the measured articulation buffers.
+        # ManagerBasedRLEnv 会在 ``step`` 内部重置已终止环境。这里保留一帧缓存，
+        # 以便在重置状态覆盖 articulation 实测缓冲区之前，仍能输出真正的终止帧。
         self._ruleresult_pending_reset_mask = None
         self._ruleresult_pending_angle = None
         self._ruleresult_pending_velocity = None
@@ -536,34 +564,33 @@ class RuleresultRecorderMixin:
 
     @property
     def ruleresult(self) -> dict[str, Any] | None:
-        """Latest selected-environment JSON-safe ruleresult row."""
+        """所选环境最近一行 JSON 安全记录；尚未记录时为 ``None``。"""
 
         self._ruleresult_init()
         return self._ruleresult_latest
 
     @property
     def ruleresult_tensor(self) -> torch.Tensor | None:
-        """Latest batch ``[N, 24]`` target tensor, if a step was recorded."""
+        """所有并行环境最近的目标结果张量 ``[N, 24]``；尚未记录时为 ``None``。"""
 
         self._ruleresult_init()
         return self._ruleresult_latest_tensor
 
     @property
     def ruleresult_prediction(self) -> dict[str, Any] | None:
-        """Latest optional future trajectory for the selected environment."""
+        """所选环境最近的可选未来序列；未启用或不可用时为 ``None``。"""
 
         self._ruleresult_init()
         return self._ruleresult_latest_prediction
 
     def set_ruleresult_prediction_callback(self, callback: Any | None) -> None:
-        """Register a callback that supplies future position targets.
+        """注册由外部提供未来位置目标的回调。
 
-        The callback is called as ``callback(env, current_targets, horizon,
-        dt_s)`` and may return a tensor with shape ``[N, H, 8]`` (or ``[H, 8]``
-        for the selected environment), or a dictionary already containing
-        ``angles``/``timestamps_s``.  The callback is intentionally optional:
-        the stock eight-dimensional PPO actor does not expose a future-action
-        head, so no callback means no claim of model-native prediction.
+        调用形式为 ``callback(env, current_targets, horizon, dt_s)``。返回值可以是
+        ``[N, H, 8]`` 张量（单环境也可用 ``[H, 8]``），也可以是已经含
+        ``angles``/``timestamps_s`` 的字典。回调可接规划器或真正的多步预测模型；默认
+        8维 PPO actor 没有未来动作头，所以没有回调时 ``supplied`` 模式会明确报告
+        unavailable，而不会把当前动作重复 H 次伪装成预测。
         """
 
         self._ruleresult_init()
@@ -577,7 +604,12 @@ class RuleresultRecorderMixin:
         env_ids: Sequence[int] | torch.Tensor | None = None,
         clear_time: bool = False,
     ) -> None:
-        """Invalidate derivative history globally or for selected environments."""
+        """清空全部或指定环境的差分历史，并按需更新 episode 编号。
+
+        reset 后新姿态与上一 episode 末姿态不连续。如果保留旧角度，第一帧速度会变成
+        ``(新初始角-旧终止角)/dt`` 的巨大假值，角加速度也会继续放大。因此至少把对应
+        环境的 history_valid 设为假；完整 reset 还会清除时间戳历史。
+        """
 
         self._ruleresult_init()
         if env_ids is None:
@@ -611,7 +643,7 @@ class RuleresultRecorderMixin:
             self._ruleresult_latest_prediction = None
 
     def _ruleresult_control_dt_s(self) -> float:
-        """Return the nominal policy period [s] used as a safe fallback."""
+        """返回标称策略控制周期 [s]，供固定时间模式和异常时钟兜底使用。"""
 
         configured = getattr(getattr(self, "cfg", None), "ruleresult_dt_s", CONTROL_DT_S)
         try:
@@ -623,9 +655,8 @@ class RuleresultRecorderMixin:
             step_dt = float(step_dt)
         except (TypeError, ValueError):
             step_dt = None
-        # A configured value is an explicit override.  If it remains at the
-        # historical default while the environment exposes a different step
-        # period, prefer the manager's authoritative period.
+        # 配置值若不是历史默认值，就视为用户显式覆盖。若它仍是历史默认值，而环境
+        # 暴露了不同的步进周期，则优先采用管理器给出的权威周期。
         if step_dt is not None and math.isfinite(step_dt) and step_dt > 0.0:
             if math.isclose(configured, CONTROL_DT_S, rel_tol=0.0, abs_tol=1e-12) and not math.isclose(
                 step_dt, CONTROL_DT_S, rel_tol=0.0, abs_tol=1e-12
@@ -636,7 +667,7 @@ class RuleresultRecorderMixin:
         return configured
 
     def _ruleresult_time_mode(self) -> str:
-        """Normalize the configured source of timestamps."""
+        """把别名归一化为 simulation、wall_clock 或 configured 时间模式。"""
 
         mode = str(getattr(getattr(self, "cfg", None), "ruleresult_time_mode", "simulation")).strip().lower()
         aliases = {"sim": "simulation", "wall": "wall_clock", "actual": "wall_clock"}
@@ -646,7 +677,12 @@ class RuleresultRecorderMixin:
         return mode
 
     def _ruleresult_sample_clock(self, control_dt_s: float) -> tuple[float, str, float, float | None]:
-        """Read simulation and monotonic clocks and select the derivative clock."""
+        """读取仿真/单调墙钟，并选出本次差分使用的时间戳。
+
+        ``simulation`` 适合离线仿真，运行再慢也保持物理时间；``wall_clock`` 反映程序
+        实际落地间隔，适合评估工控机调度抖动；``configured`` 始终按步数乘标称周期。
+        返回值同时保留墙钟信息，JSONL 因而能比较物理时间和真实输出耗时。
+        """
 
         wall_now = time.perf_counter() - self._ruleresult_wall_clock_origin
         previous_wall = getattr(self, "_ruleresult_previous_wall_timestamp", None)
@@ -667,7 +703,7 @@ class RuleresultRecorderMixin:
         return self._ruleresult_step * control_dt_s, "configured", wall_now, wall_dt
 
     def _ruleresult_position_target(self) -> torch.Tensor:
-        """Read processed absolute position targets in canonical order."""
+        """读取动作管理器处理后的绝对位置目标并重排为 ``[N, 8]`` [rad]。"""
 
         term = self.action_manager.get_term("joint_pos")
         target = _as_tensor(term.processed_actions)
@@ -675,7 +711,7 @@ class RuleresultRecorderMixin:
         return _reorder_joint_tensor(target, term_names)
 
     def _ruleresult_measured_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Read measured joint position, velocity, and acceleration tensors."""
+        """读取实际关节角、速度、角加速度，均为公共顺序的 ``[N, 8]`` 张量。"""
 
         robot = self.scene["robot"]
         names = tuple(getattr(robot, "joint_names", ACTUATED_JOINT_NAMES))
@@ -686,7 +722,7 @@ class RuleresultRecorderMixin:
         )
 
     def _ruleresult_raw_action(self) -> torch.Tensor:
-        """Read the normalized policy action in canonical joint order."""
+        """读取 actor 原始归一化动作，重排为公共顺序的 ``[N, 8]``。"""
 
         term = self.action_manager.get_term("joint_pos")
         action = getattr(term, "raw_actions", None)
@@ -700,7 +736,7 @@ class RuleresultRecorderMixin:
     def _ruleresult_env_ids(
         env_ids: Sequence[int] | torch.Tensor | slice, count: int, device: torch.device
     ) -> torch.Tensor:
-        """Normalize reset IDs to a one-dimensional device tensor."""
+        """把 reset 环境编号统一为目标设备上的一维整数张量。"""
 
         if isinstance(env_ids, slice):
             start, stop, step = env_ids.indices(count)
@@ -708,7 +744,12 @@ class RuleresultRecorderMixin:
         return torch.as_tensor(env_ids, device=device, dtype=torch.long).reshape(-1)
 
     def _ruleresult_capture_before_reset(self, env_ids: Sequence[int] | torch.Tensor | slice) -> None:
-        """Cache terminal state before the manager environment resets it."""
+        """在 ManagerBasedRLEnv 覆盖状态前缓存终止帧。
+
+        Isaac Lab 会在一次 ``step`` 内完成终止判断和自动 reset；当外层 ``step`` 返回
+        时，实时关节缓冲区已经是新 episode 的初始姿态。这里提前保存目标、反馈和动作，
+        让随后写出的 done 行仍表示真正终止瞬间，而不是误写 reset 后状态。
+        """
 
         self._ruleresult_init()
         if not bool(getattr(getattr(self, "cfg", None), "ruleresult_enabled", False)):
@@ -718,8 +759,8 @@ class RuleresultRecorderMixin:
             measured = tuple(value.detach() for value in self._ruleresult_measured_state())
             raw_action = self._ruleresult_raw_action().detach()
         except (AttributeError, RuntimeError, TypeError, ValueError):
-            # During construction/reset teardown managers may not exist yet.
-            # The normal step path will simply fall back to live buffers.
+            # 在构造阶段或 reset 收尾阶段，管理器可能尚未存在。正常 step 路径随后会
+            # 自动回退到实时缓冲区，因此此处可以直接跳过快照。
             return
         if target.ndim != 2:
             return
@@ -744,8 +785,7 @@ class RuleresultRecorderMixin:
         self._ruleresult_pending_velocity[ids] = measured[1][ids]
         self._ruleresult_pending_acceleration[ids] = measured[2][ids]
         self._ruleresult_pending_action[ids] = raw_action[ids]
-        # The terminal angle is the target trajectory value; measured position
-        # is stored separately in the cache to avoid conflating the two.
+        # 终止角度保存的是目标轨迹值；实测位置单独缓存在另一字段中，避免混淆二者。
         if self._ruleresult_pending_measured_angle is None or tuple(
             self._ruleresult_pending_measured_angle.shape
         ) != tuple(measured[0].shape):
@@ -753,12 +793,14 @@ class RuleresultRecorderMixin:
         self._ruleresult_pending_measured_angle[ids] = measured[0][ids]
 
     def _reset_idx(self, env_ids: Sequence[int]):
-        """Capture terminal values before delegating to the base reset."""
+        """先抓取指定环境的终止值，再调用基础环境完成 reset。"""
 
         self._ruleresult_capture_before_reset(env_ids)
         return super()._reset_idx(env_ids)
 
     def _ruleresult_output_file(self) -> Path:
+        """解析输出路径；相对路径以运行日志目录或当前目录为基准。"""
+
         configured = getattr(self.cfg, "ruleresult_output_path", None)
         default_name = "ruleresult.bin" if self._ruleresult_output_format() == "protocol_55aa" else "ruleresult.jsonl"
         path = Path(configured).expanduser() if configured else Path(default_name)
@@ -767,7 +809,12 @@ class RuleresultRecorderMixin:
         return path
 
     def _ruleresult_output_format(self) -> str:
-        """Return the normalized on-disk output format."""
+        """返回规范化磁盘格式：可读 ``jsonl`` 或严格字节 ``protocol_55aa``。
+
+        JSONL 每行自带字段名、单位、时间戳、反馈和可选未来序列，适合调试与离线分析；
+        protocol_55aa 每周期只有一个 53B 电机命令帧，适合交给通讯层，但不携带时间戳、
+        measured 反馈、schema 或预测序列。
+        """
 
         output_format = str(getattr(self.cfg, "ruleresult_output_format", "jsonl")).strip().lower()
         aliases = {"json": "jsonl", "55aa": "protocol_55aa", "protocol-55aa": "protocol_55aa"}
@@ -777,7 +824,7 @@ class RuleresultRecorderMixin:
         return output_format
 
     def _ruleresult_protocol_encoder(self) -> Protocol55AAConfig:
-        """Load and cache the configured 55AA quantization contract."""
+        """读取并缓存 55AA 电机标定配置；二进制导出必须显式提供该文件。"""
 
         configured = getattr(self.cfg, "ruleresult_protocol_config_path", None)
         if configured is None or not str(configured).strip():
@@ -797,7 +844,13 @@ class RuleresultRecorderMixin:
         acceleration: torch.Tensor,
         control_dt_s: float,
     ) -> tuple[dict[str, torch.Tensor] | None, str]:
-        """Build an optional future sequence without pretending to be a policy rollout."""
+        """按配置生成可选未来序列，并明确标注它是否真正可用。
+
+        ``none`` 不输出未来；``kinematic`` 用当前 q/v/a 作恒加速度外推；``supplied``
+        调用外部回调取得未来角度，并在缺少 v/a 时按未来时间戳求导。只有 supplied 的
+        来源可能是实际规划器或多步模型，两种模式都不会自动多次调用当前 PPO actor。
+        返回的批量序列形状为 ``[N, H, 8]``。
+        """
 
         horizon = int(getattr(self.cfg, "ruleresult_prediction_horizon", 0))
         mode = str(getattr(self.cfg, "ruleresult_prediction_mode", "none")).strip().lower()
@@ -824,9 +877,8 @@ class RuleresultRecorderMixin:
 
         callback = self._ruleresult_prediction_callback
         if callback is None:
-            # A configured ``supplied`` mode without a sequence is explicit
-            # about being unavailable; silently repeating the current action
-            # would be misleading and unsafe.
+            # 配置为 ``supplied`` 却没有提供序列时，应明确标记为不可用。若静默重复
+            # 当前动作，会让调用方误以为这是真正的未来预测，并带来安全风险。
             return None, "unavailable"
         supplied = callback(self, target.detach(), horizon, prediction_dt)
         if isinstance(supplied, dict):
@@ -885,7 +937,13 @@ class RuleresultRecorderMixin:
         return prediction, "available"
 
     def _ruleresult_record_after_step(self, result: Any = None) -> None:
-        """Update the 24-D result and optionally append one JSONL row."""
+        """在一次环境步之后更新 ``[N, 24]`` 结果，并按设置写 JSONL 或 55AA。
+
+        处理顺序是：读取目标和 done 掩码、还原已 reset 环境的终止快照、选择时间源、
+        用非均匀 dt 计算导数、构造所选环境记录、可选生成未来序列、最后写盘并 flush。
+        第一次样本、reset 后第一帧或时钟跳变后的第一帧没有可靠历史，导数置零并通过
+        ``derivative_history_valid`` 告知读取者。
+        """
 
         self._ruleresult_init()
         if not bool(getattr(self.cfg, "ruleresult_enabled", False)):
@@ -904,9 +962,8 @@ class RuleresultRecorderMixin:
                 raise ValueError("ruleresult termination masks must match the environment batch")
             done = terminated | truncated
 
-        # A terminated environment has already been reset by the base class at
-        # this point.  Replace its live target with the snapshot captured by
-        # ``_reset_idx`` so the exported row represents the terminal action.
+        # 执行到这里时，终止环境已经被基类重置。用 ``_reset_idx`` 提前保存的快照
+        # 替换实时目标，使导出的这一行仍表示终止动作，而不是重置后的初始动作。
         target = live_target.clone()
         pending_mask = self._ruleresult_pending_reset_mask
         terminal_mask = done
@@ -930,9 +987,8 @@ class RuleresultRecorderMixin:
             math.isfinite(timestamp_delta) and min_dt_s <= timestamp_delta <= max_dt_s
         )
         time_gap_detected = timestamp_delta is not None and not clock_valid
-        # Some simulator wrappers expose a constant current_time field rather
-        # than advancing it.  Treat an exact zero delta as a configured-clock
-        # fallback for compatibility; a negative delta remains invalid.
+        # 有些仿真器包装层暴露的 current_time 不会递增。为兼容这种情况，时间差恰好
+        # 为零时回退到配置周期；负时间差仍然视为无效。
         if timestamp_delta is not None and timestamp_delta == 0.0 and timestamp_source == "simulation":
             sample_dt_s = control_dt_s
             derivative_dt_source = "configured_fallback"
@@ -965,10 +1021,9 @@ class RuleresultRecorderMixin:
             previous_velocity = previous_velocity.to(device=device, dtype=target.dtype)
             history_valid = history_valid.to(device=device)
         history_valid_before = history_valid.clone()
-        # Derivatives are independent per environment.  Invalid rows (the
-        # first sample after reset or after a clock discontinuity) start at
-        # zero.  For a jittering clock, acceleration uses the midpoint of the
-        # current and previous intervals.
+        # 每个并行环境独立计算导数。reset 后首帧或时钟中断后的首帧没有有效历史，
+        # 因而从零速度、零加速度开始。时钟有抖动时，角加速度使用当前与上一采样间隔
+        # 的平均值作为差分时间。
         derivative_history_valid = history_valid & bool(clock_valid)
         velocity = (target - previous_angle) / sample_dt_s
         velocity = torch.where(derivative_history_valid.unsqueeze(-1), velocity, torch.zeros_like(velocity))
@@ -1068,8 +1123,8 @@ class RuleresultRecorderMixin:
                 if output_format == "jsonl":
                     self._ruleresult_stream = output_path.open("a", encoding="utf-8")
                 else:
-                    # The wire frame has no version field. Never mix prior
-                    # recordings (including v1 little-endian frames) with v2.
+                    # 线上的二进制帧没有版本字段，因此绝不能把旧记录（包括 v1 小端帧）
+                    # 与 v2 帧混写到同一个文件中。
                     if output_path.exists() and output_path.stat().st_size > 0:
                         raise ValueError(
                             f"refusing to append protocol frames to existing non-empty file {output_path}; "
@@ -1088,23 +1143,21 @@ class RuleresultRecorderMixin:
                 env_ids=done_ids,
                 increment_episode=bool(done[env_id]),
             )
-        # A pending snapshot is meaningful for this step only.  Clearing it
-        # here prevents a later non-terminal step from reusing stale state.
+        # 待处理快照只对当前 step 有效。在这里清空它，避免后续未终止 step 误用旧状态。
         if self._ruleresult_pending_reset_mask is not None:
             self._ruleresult_pending_reset_mask.zero_()
 
     def reset(self, *args, **kwargs):
-        """Reset the base environment and start a fresh derivative history."""
+        """执行公开 reset，并为受影响环境开启全新的差分历史。"""
 
         requested_env_ids = kwargs.get("env_ids")
-        # ManagerBasedRLEnv.reset(seed, env_ids, options) keeps env_ids in the
-        # second positional slot.  Preserve the other environments' history
-        # when a caller performs a partial reset.
+        # ManagerBasedRLEnv.reset(seed, env_ids, options) 把 env_ids 放在第二个位置参数。
+        # 调用方只重置部分环境时，其余环境的差分历史必须保留。
         if requested_env_ids is None and len(args) >= 2:
             requested_env_ids = args[1]
         result = super().reset(*args, **kwargs)
-        # The first public reset starts episode 0.  Later manual resets advance
-        # the label; automatic same-step resets are handled in ``step``.
+        # 第一次公开 reset 从 episode 0 开始；后续手动 reset 才递增编号。同一 step 内
+        # 自动发生的重置由 ``step`` 路径单独处理。
         has_previous_episode = self._ruleresult_step > 0 or self._ruleresult_latest is not None
         if requested_env_ids is None:
             self._ruleresult_clear_history(increment_episode=has_previous_episode, clear_time=True)
@@ -1125,7 +1178,7 @@ class RuleresultRecorderMixin:
         return result
 
     def reset_to(self, state, env_ids, seed=None, is_relative=False):
-        """Restore simulator state and invalidate affected derivative history."""
+        """恢复外部指定的仿真状态，并使对应环境旧差分历史失效。"""
 
         result = super().reset_to(state, env_ids, seed=seed, is_relative=is_relative)
         has_previous_episode = self._ruleresult_step > 0 or self._ruleresult_latest is not None
@@ -1142,7 +1195,7 @@ class RuleresultRecorderMixin:
         return result
 
     def close(self):
-        """Close the result stream before releasing the simulation."""
+        """在释放仿真资源前关闭并清空结果文件句柄。"""
 
         self._ruleresult_init()
         if self._ruleresult_stream is not None:

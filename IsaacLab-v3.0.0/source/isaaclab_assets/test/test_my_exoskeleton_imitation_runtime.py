@@ -1,4 +1,9 @@
-"""Dependency-light shape checks for the EVIS event bridge."""
+"""模仿环境可选传感器与 EVIS 事件桥接的轻依赖运行时测试。
+
+本文件保护事件掩码的环境批量维解释、诊断记录的 JSON 安全性，以及传感器缺失/禁用
+时“固定 shape 零张量 + invalid 掩码”的降级契约。该契约保证关闭 IMU、RGB、事件或
+足底接触后 PPO 网络维度不变，同时缺失数据不会误拿到模仿奖励。
+"""
 
 from __future__ import annotations
 
@@ -31,12 +36,16 @@ from isaaclab_assets.tasks.my_exoskeleton_imitation import _event_mask_batch, bu
     ],
 )
 def test_event_mask_batch_normalizes_single_and_batched_masks(shape, expected):
+    """把常见单帧/批量事件掩码统一成 ``[环境数, 高, 宽]``，供奖励函数稳定使用。"""
+
     value = _event_mask_batch(torch.ones(shape), 4, "cpu")
     assert value is not None
     assert tuple(value.shape) == expected
 
 
 def test_event_mask_batch_rejects_ambiguous_environment_axis():
+    """若张量的批量轴既不是1也不是环境数，就返回无效，避免把相机轴误当环境轴。"""
+
     assert _event_mask_batch(torch.ones((2, 8, 10)), 4, "cpu") is None
     assert _event_mask_batch(torch.ones((2, 3, 8, 10)), 4, "cpu") is None
 
@@ -72,6 +81,8 @@ def test_diagnostics_snapshot_is_compact_and_json_safe():
 
 
 def test_event_reward_masks_decoded_target_when_runtime_evis_is_unavailable():
+    """即使离线目标有效，运行时 EVIS 无数据时事件模仿奖励也必须为零。"""
+
     class Env:
         num_envs = 2
         device = torch.device("cpu")
@@ -89,7 +100,7 @@ def test_event_reward_masks_decoded_target_when_runtime_evis_is_unavailable():
 
 
 def test_disabled_sensor_observations_are_fixed_shape_zero_and_invalid():
-    """Ablating optional channels must not make manager shape probes fail."""
+    """关闭可选通道后，管理器的观测 shape 探测仍必须成功。"""
 
     class Env:
         num_envs = 3
@@ -114,7 +125,7 @@ def test_disabled_sensor_observations_are_fixed_shape_zero_and_invalid():
 
 
 def test_disabled_contact_sensor_never_reads_scene_entities():
-    """Contact ablation returns zeros even when the scene has no contact keys."""
+    """关闭接触通道后，即使场景没有接触键，也应返回固定 shape 的全零值。"""
 
     class Env:
         num_envs = 2

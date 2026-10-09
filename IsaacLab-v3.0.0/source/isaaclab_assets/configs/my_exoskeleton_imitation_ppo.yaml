@@ -1,16 +1,24 @@
-# rl_games PPO for Isaac-MyExoskeleton-Imitation-v0.
-# Camera/event observations are compact GPU features (not 256x256 tensors),
-# which keeps the 4096-environment rollout within a practical memory budget.
+# 多模态模仿任务 Isaac-MyExoskeleton-Imitation-v0 的 RL-Games PPO 配置。
+#
+# 环境会把相机和事件数据压缩成紧凑 GPU 特征，而不是把 256x256 原图直接送入 PPO。
+# actor 最终输入为 49 基础状态 + 54 IMU + 12 RGB + 32 事件 = 147 维，输出仍为
+# 8 个归一化关节动作；critic 使用 62 维仿真特权状态。动作随后围绕默认关节姿态按
+# 每关节 scale 转成绝对目标角，并不是“当前角度 + 网络增量”。
 seed: 42
 params:
+  # 固定随机种子用于复现实验；命令行 --seed 可以覆盖它。
   seed: 42
   algo:
+    # RL-Games 使用这个历史名称实现连续动作 PPO。
     name: a2c_continuous
   model:
+    # 网络输出高斯动作分布，logstd 控制训练期间的探索噪声。
     name: continuous_a2c_logstd
   env:
+    # 观测异常值截断到 [-100,100]，网络动作截断到 [-1,1]。
     clip_observations: 100.0
     clip_actions: 1.0
+    # obs 列表按顺序拼接成 147 维 actor 输入；states 不拼给 actor，只供 critic。
     obs_groups:
       obs: [policy, imu, camera_rgb, event_camera]
       states: [critic]
@@ -26,9 +34,11 @@ params:
           name: default
         sigma_init:
           name: const_initializer
+          # exp(-0.22314355) 约为 0.8，即初始动作探索标准差。
           val: -0.22314355
         fixed_sigma: true
     mlp:
+      # 147 维输入先经过两个 256 单元全连接层。
       units: [256, 256]
       activation: elu
       d2rl: false
@@ -37,6 +47,7 @@ params:
       regularizer:
         name: None
     rnn:
+      # LSTM 在 MLP 前处理连续观测，帮助识别步态相位；每段训练序列长 16 步。
       name: lstm
       units: 128
       layers: 1
@@ -44,44 +55,57 @@ params:
       concat_input: true
       layer_norm: false
   config:
+    # 该名称决定默认日志目录 logs/rl_games/my_exoskeleton_imitation_ppo/。
     name: my_exoskeleton_imitation_ppo
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'
     multi_gpu: false
     ppo: true
+    # 时间上限截断时用 critic 做价值 bootstrap，而真正倒地等终止不会当作普通截断。
     use_experimental_cv: false
     value_bootstrap: true
     reward_shaper:
       scale_value: 1.0
+    # 优势标准化降低不同 batch 尺度差异；adaptive 根据 KL 偏离程度调学习率。
     normalize_advantage: true
     lr_schedule: adaptive
     schedule_type: standard
     kl_threshold: 0.01
     score_to_win: 100000
+    # 训练 100 个 epoch 后开始保存最佳平均奖励，每 200 个 epoch 保存周期 checkpoint。
     save_best_after: 100
     save_frequency: 200
     print_stats: true
     critic_coef: 2.0
     bounds_loss_coef: 0.0001
+    # 对输入和价值使用运行统计标准化；恢复训练必须加载完整 checkpoint 中的统计量。
     normalize_input: true
     normalize_value: true
+    # 启动时 num_actors 会被实际环境数覆盖。4096 是正式训练默认并行规模。
     num_actors: 4096
+    # 一个 PPO epoch 收集 num_envs * 32 条控制步样本；控制步标称为 0.02 s。
     horizon_length: 32
+    # 每次参数更新取 512 条样本；LSTM 按连续 16 步切分，episode 结束清空记忆。
     minibatch_size: 512
     seq_length: 16
     zero_rnn_on_done: true
+    # 每份 rollout 重复训练 5 轮；学习率为 3e-4。
     mini_epochs: 5
     learning_rate: 3.0e-4
+    # gamma/tau 控制长期回报和 GAE，e_clip=0.2 限制新旧策略一次变化过大。
     gamma: 0.99
     tau: 0.95
     e_clip: 0.2
+    # 熵系数维持探索，梯度裁剪到范数 1 以减轻训练突然发散。
     entropy_coef: 0.01
     clip_value: true
     truncate_grads: true
     grad_norm: 1.0
+    # 最大 30000 个 PPO epoch；这里的 epoch 不是单个物理帧或 episode。
     max_epochs: 30000
     central_value_config:
+      # central value 网络只在训练时读取 62 维 critic 状态；实体机推理只部署 actor。
       minibatch_size: 512
       mini_epochs: 5
       learning_rate: 3.0e-4

@@ -150,7 +150,7 @@ class DryRunBus:
     def open(self) -> None:
         """模拟打开总线；空运行没有需要分配的外部资源。"""
 
-        return None
+        return None  # noqa: RET501 - 显式表示空运行无需返回任何通信资源。
 
     def close(self) -> None:
         """模拟关闭总线，并把使能状态清零。"""
@@ -184,8 +184,7 @@ class DryRunBus:
             raise ValueError("command hardware order does not match bus")
         count = len(self.hardware_ids)
         if any(
-            len(values) != count
-            for values in (frame.position_rad, frame.velocity_rad_s, frame.acceleration_rad_s2)
+            len(values) != count for values in (frame.position_rad, frame.velocity_rad_s, frame.acceleration_rad_s2)
         ):
             raise ValueError("command vector length does not match hardware_ids")
         self.last_frame = frame

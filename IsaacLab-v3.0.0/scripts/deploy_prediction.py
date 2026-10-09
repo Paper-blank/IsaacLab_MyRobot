@@ -27,13 +27,13 @@ import argparse
 import sys
 from pathlib import Path
 
-try:  # Direct invocation: ``python scripts/deploy_prediction.py``.
+try:  # 直接运行方式：``python scripts/deploy_prediction.py``。
     from deployment.joint_mapping import JointMapper, MappingError
     from deployment.motor_bus import DryRunBus
     from deployment.replay import ReplayConfig, replay
     from deployment.safety import SafetyConfig, SafetyLimiter, SafetyViolation
     from deployment.trajectory import TrajectoryError, load_trajectory
-except ImportError:  # Module invocation: ``python -m scripts.deploy_prediction``.
+except ImportError:  # 模块运行方式：``python -m scripts.deploy_prediction``。
     from scripts.deployment.joint_mapping import JointMapper, MappingError
     from scripts.deployment.motor_bus import DryRunBus
     from scripts.deployment.replay import ReplayConfig, replay
@@ -49,9 +49,7 @@ def _parser() -> argparse.ArgumentParser:
         命令行格式，不读取文件，也不会启动回放。
     """
 
-    parser = argparse.ArgumentParser(
-        description="Validate/replay a JSON or JSONL trajectory (dry-run only)."
-    )
+    parser = argparse.ArgumentParser(description="Validate/replay a JSON or JSONL trajectory (dry-run only).")
     parser.add_argument("prediction", type=Path, help="trajectory file")
     parser.add_argument("--mapping", type=Path, help="JSON joint-to-motor calibration")
     parser.add_argument("--episode", type=int, help="episode to select from an appended JSONL file")
@@ -123,8 +121,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     bus = DryRunBus(mapper.hardware_ids)
-    callback = None if args.quiet else lambda frame: print(
-        f"dry-run seq={frame.sequence} t_ns={frame.timestamp_ns} q0={frame.position_rad[0]:.6f}"
+    callback = (
+        None
+        if args.quiet
+        else lambda frame: print(
+            f"dry-run seq={frame.sequence} t_ns={frame.timestamp_ns} q0={frame.position_rad[0]:.6f}"
+        )
     )
     try:
         count = replay(

@@ -200,8 +200,7 @@ def _apply_sensor_scene_overrides(argv: list[str]) -> list[str]:
             continue
         for entity in entities:
             prefix = f"env.scene.{entity}="
-            # Keep an explicit sensor-off switch authoritative even when the
-            # caller also supplied a direct scene override for that entity.
+            # 即使调用者还直接覆盖了该场景实体，也必须以显式的传感器关闭开关为准。
             result = [argument for argument in result if not argument.startswith(prefix)]
             result.append(f"{prefix}null")
     return result
@@ -316,9 +315,8 @@ def _consume_exoskeleton_cli_args(argv: list[str]) -> list[str]:
             remaining.append(f"{_REFERENCE_PATH_OVERRIDE}{dataset_path!r}")
         if not explicit_tasks and task_id is None:
             remaining.extend(["--task", _IMITATION_GYM_TASK])
-    # Keep this aggregate consumer as the single entrypoint for custom flags;
-    # callers that only know about the historical helper still get sensor
-    # switches removed before Hydra sees them.
+    # 统一由这个聚合函数消费自定义参数；即使调用者只认识旧版辅助函数，也能在参数
+    # 交给 Hydra 前移除传感器开关。
     return _consume_sensor_cli_args(remaining)
 
 
@@ -507,11 +505,9 @@ def _consume_ruleresult_args(argv: list[str]) -> list[str]:  # noqa: C901
                     raise ValueError(f"{option} must be a positive number") from exc
                 prediction_dt = value
             else:
-                # A path supplied on the command line is anchored to the
-                # launch directory before the RL backend assigns
-                # ``env.cfg.log_dir`` to the checkpoint run directory.  This
-                # keeps ``--ruleresult-output logs/foo.jsonl`` from silently
-                # becoming ``<run_dir>/logs/foo.jsonl``.
+                # 先以启动目录为基准解析命令行路径，再让 RL 后端把 ``env.cfg.log_dir``
+                # 指向 checkpoint 运行目录。这样 ``--ruleresult-output logs/foo.jsonl``
+                # 就不会悄悄变成 ``<run_dir>/logs/foo.jsonl``。
                 resolved_output = Path(value).expanduser()
                 if not resolved_output.is_absolute():
                     resolved_output = (Path.cwd() / resolved_output).resolve()
@@ -665,8 +661,8 @@ def main() -> int:
     import isaaclab_assets.my_exoskeleton  # noqa: F401
 
     argv = _consume_exoskeleton_cli_args(list(sys.argv[1:]))
-    # Keep the explicit stage for callers that replace the aggregate consumer;
-    # it is idempotent because the aggregate already removes sensor aliases.
+    # 为替换了聚合参数处理器的调用者保留这一显式步骤；聚合处理器已移除传感器别名，
+    # 因此重复调用不会改变结果。
     argv = _consume_sensor_cli_args(argv)
     argv = _consume_diagnostics_args(argv)
     argv = _consume_ruleresult_args(argv)

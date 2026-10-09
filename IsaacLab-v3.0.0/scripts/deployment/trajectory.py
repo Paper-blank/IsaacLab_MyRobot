@@ -295,7 +295,7 @@ class Trajectory:
 
     @property
     def duration_s(self) -> float:
-        """返回归一化轨迹终点时间 [s]。"""
+        """返回最后一个采样的时间戳 [s]；默认归一化加载时它就是轨迹时长。"""
 
         return self.samples[-1].timestamp_s
 
@@ -358,7 +358,6 @@ class Trajectory:
         Raises:
             TrajectoryError: 查询时间不是有限值，或插值方法未知。
         """
-
 
         query = _finite(time_s, "sample time")
         method = method.lower()
@@ -448,11 +447,7 @@ def _records(documents: list[Any]) -> list[dict[str, Any]]:
         elif isinstance(document, dict):
             values = _field(document, "trajectory", "waypoints", "records")
             if isinstance(values, list):
-                inherited = {
-                    key: document[key]
-                    for key in ("schema", "joint_names", "episode")
-                    if key in document
-                }
+                inherited = {key: document[key] for key in ("schema", "joint_names", "episode") if key in document}
             else:
                 values = [document]
                 inherited = {}
@@ -629,9 +624,7 @@ def load_trajectory(
     rows = _records(_read_json_documents(source))
     for row in rows:
         episode_value = row.get("episode")
-        if episode_value is not None and (
-            isinstance(episode_value, bool) or not isinstance(episode_value, (int, str))
-        ):
+        if episode_value is not None and (isinstance(episode_value, bool) or not isinstance(episode_value, (int, str))):
             raise TrajectoryError("episode must be an integer or numeric string")
     if episode is not None:
         rows = [row for row in rows if row.get("episode") in {episode, str(episode)}]
@@ -651,9 +644,7 @@ def load_trajectory(
         if _field(row, "timestamp_s", "timestamp", "time_s") is None:
             row = dict(row)
             row["timestamp_s"] = row_index * default_dt_s
-        samples.extend(
-            _expand_record(row, use_nested_prediction=use_nested_prediction, default_dt_s=default_dt_s)
-        )
+        samples.extend(_expand_record(row, use_nested_prediction=use_nested_prediction, default_dt_s=default_dt_s))
     if not samples:
         raise TrajectoryError("trajectory contains no samples")
     samples.sort(key=lambda item: item.timestamp_s)

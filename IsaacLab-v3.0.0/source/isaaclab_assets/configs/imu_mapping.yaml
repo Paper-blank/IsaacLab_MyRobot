@@ -1,3 +1,5 @@
+# 安装包内的 IMU 映射副本。运行时通常优先读取项目根目录同名文件；
+# 两份文件应保持同一传感器编号和身体部位含义。
 version: 1
 description: Six retained IMUs in recorder order (ankle 01/02, knee 03/04, hip 05/06).
 imu_mapping:
@@ -31,4 +33,5 @@ imu_mapping:
     robot_link: right_thigh
     role: "右髋关节/大腿近端"
     aliases: [Rthigh, r_thigh, thigh_right, hip_right, right_hip]
+# 当前策略固定使用前 6 个 IMU，其余通道显式忽略。
 ignored_imus: [imu_07, imu_08, imu_09, imu_10, imu_11]

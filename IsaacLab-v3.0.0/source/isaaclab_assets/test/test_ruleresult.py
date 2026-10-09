@@ -3,7 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Pure-Python tests for the exoskeleton ruleresult contract."""
+"""外骨骼 ruleresult 轨迹导出契约的纯 Python 测试。
+
+本文件保护24维字段顺序、单位、非均匀时间差分、目标与 measured 反馈分离、reset 后
+历史隔离，以及 JSONL/55AA 两种落盘路径。二进制集成测试使用独立固件公式反解黄金帧，
+避免编码器和测试共用同一实现而同时犯错；未来序列测试也明确区分运动学外推和真正的
+外部预测。
+"""
 
 import json
 import math
@@ -31,6 +37,8 @@ from isaaclab_assets.tasks.ruleresult import (
 
 
 def _protocol_recorder_env(output_path, protocol_config_path):
+    """给定输出和标定路径，构造只实现记录器所需接口的最小两环境夹具。"""
+
     class Term:
         _joint_names = ACTUATED_JOINT_NAMES
         processed_actions = torch.arange(1, 9, dtype=torch.float32).unsqueeze(0) * 0.02
@@ -69,6 +77,8 @@ def _protocol_recorder_env(output_path, protocol_config_path):
 
 
 def _write_protocol_config(path):
+    """写出测试专用、身份标定且带宽松安全范围的可用 v2 协议配置。"""
+
     path.write_text(
         json.dumps(
             {
@@ -97,7 +107,7 @@ def _write_protocol_config(path):
 
 
 def test_target_kinematics_are_field_major_and_use_control_dt():
-    """Finite differences produce velocity and acceleration in the documented units."""
+    """有限差分应按文档约定的单位生成角速度和角加速度。"""
 
     first = torch.zeros(8)
     second = torch.ones(8) * 0.02
@@ -117,7 +127,7 @@ def test_target_kinematics_are_field_major_and_use_control_dt():
 
 
 def test_ruleresult_record_contains_canonical_joints_and_units():
-    """One output row is JSON-safe and self-describing."""
+    """单行输出必须能安全序列化为 JSON，并且字段足以自描述。"""
 
     values = torch.arange(8, dtype=torch.float32)
     record = build_ruleresult_record(
@@ -145,7 +155,11 @@ def test_target_kinematics_reject_invalid_period_or_shape():
 
 
 def test_prediction_sequence_uses_non_uniform_timestamps():
-    """Future derivatives use each interval rather than a fixed 20 ms period."""
+    """给定不均匀时间戳，每段速度和加速度必须使用自己的真实间隔，而非固定20 ms。
+
+    第二帧与第一帧相差30 ms，第三帧再相差50 ms；这些刻意不同的间隔构成黄金结果，
+    可以发现把实际落地输出错误地当成严格50 Hz的问题。
+    """
 
     targets = torch.stack((torch.zeros(8), torch.ones(8) * 0.02, torch.ones(8) * 0.08))
     result = predict_ruleresult_sequence(targets, timestamps_s=torch.tensor([0.02, 0.05, 0.10]))
@@ -193,7 +207,7 @@ def test_ruleresult_record_rejects_non_finite_time_metadata():
 
 
 def test_recorder_writes_target_and_measured_values(tmp_path):
-    """The environment adapter writes one canonical JSONL row without Kit."""
+    """环境适配器无需启动 Kit 也能写出一行规范 JSONL 记录。"""
 
     class Data:
         joint_pos = torch.zeros(1, 8)
@@ -259,7 +273,7 @@ def test_recorder_writes_one_protocol_frame_and_keeps_readable_result(tmp_path):
 
 
 def test_recorder_frames_match_independent_firmware_decode_and_eight_motor_mapping(tmp_path):
-    """A real recorder output uses motor order, signed velocity, and fixed scales."""
+    """连续记录两帧后，用独立固件公式验证8电机顺序、带符号速度和固定量程。"""
 
     config_path = tmp_path / "protocol.json"
     output_path = tmp_path / "frames.bin"
@@ -285,7 +299,7 @@ def test_recorder_frames_match_independent_firmware_decode_and_eight_motor_mappi
         velocity = record["velocity_rad_s"][index]
         acceleration = abs(record["angular_acceleration_rad_s2"][index])
         offset = 3 + 6 * slot
-        # Exactly the user's C byte reconstruction, independent of the codec.
+        # 完全按照实体机 C 代码拼接两个大端字节，不复用 Python 解码器。
         raw_angle = (frame[offset] << 8) | frame[offset + 1]
         raw_velocity = (frame[offset + 2] << 8) | frame[offset + 3]
         raw_acceleration = (frame[offset + 4] << 8) | frame[offset + 5]
@@ -319,7 +333,7 @@ def test_protocol_output_requires_a_configuration_path(tmp_path):
 
 
 def test_recorder_uses_wall_dt_and_emits_optional_kinematic_prediction(tmp_path, monkeypatch):
-    """Wall-clock mode exposes jitter without changing the flat 24-D tensor."""
+    """墙钟模式应暴露真实调度抖动，但不能改变扁平的 24 维结果张量。"""
 
     import isaaclab_assets.tasks.ruleresult as ruleresult_module
 
@@ -382,7 +396,11 @@ def test_recorder_uses_wall_dt_and_emits_optional_kinematic_prediction(tmp_path,
 
 
 def test_recorder_keeps_terminal_frame_and_isolates_reset_history(tmp_path):
-    """Auto-reset environments must not leak derivative history across episodes."""
+    """终止时先保存最后一帧，随后 reset 的新回合不能沿用上一回合的差分历史。
+
+    两个并行环境分别通过 ``_reset_idx`` 和 ``reset_to`` 重置；未重置行仍应算出50 rad/s，
+    被重置行的首帧速度必须归零，从而证明历史是逐环境隔离的。
+    """
 
     class Data:
         def __init__(self):

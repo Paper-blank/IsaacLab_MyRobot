@@ -1,3 +1,6 @@
+# 这是一份便于阅读和外部工具使用的模仿奖励契约；当前训练真正生效的权重仍由
+# my_exoskeleton_imitation_env_cfg.py 中的 RewardTermCfg 决定。
+# 相似度使用 exp(-MSE / sigma^2)，范围为0到1；缺失通道不会被当成完美匹配。
 version: 1
 description: Multimodal imitation reward contract for Isaac-MyExoskeleton-Imitation-v0.
 weights:
@@ -19,7 +22,7 @@ channels:
   imu_count: 6
   imu_features: [roll_rad, pitch_rad, yaw_rad, gyro_x_rad_s, gyro_y_rad_s, gyro_z_rad_s, acc_x_m_s2, acc_y_m_s2, acc_z_m_s2]
   rgb_feature_layout: [left_mean_rgb, right_mean_rgb, left_std_rgb, right_std_rgb]
-  # Four camera/polarity planes; each PPO frame is pooled to 2x4 spatial bins.
+  # 双相机 × 正负极性共4个平面；每个PPO时刻把每个平面池化为2×4格。
   event_histogram_layout: [left_positive, left_negative, right_positive, right_negative]
 validity:
   missing_motion: mask_joint_reward

@@ -3,7 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Pure-Python tests for the eight-motor ``55 AA`` wire protocol."""
+"""8电机 ``55 AA`` 线路协议的纯 Python 合约测试。
+
+这些测试用独立黄金字节保护53B帧布局、大端字段、XOR范围、槽位1至8顺序、流式重新
+同步和固件物理量公式。还验证量化前与反解后的双重软限位、v1/示例配置拒绝，以及
+方向和减速比只应用一次。该测试不连接真实总线，但可阻止会让固件误读电机命令的字节
+级回归。
+"""
 
 import math
 
@@ -26,6 +32,8 @@ from isaaclab_assets.tasks.robot_contract import ACTUATED_JOINT_NAMES
 
 
 def _raw_commands() -> tuple[RawMotorCommand, ...]:
+    """给定槽位1至8，生成每个 uint16 都不同的黄金原始电机记录。"""
+
     return (
         RawMotorCommand(0x0000, 0x0001, 0x0002),
         RawMotorCommand(0x0102, 0x0304, 0x0506),
@@ -39,6 +47,8 @@ def _raw_commands() -> tuple[RawMotorCommand, ...]:
 
 
 def _motor(slot: int, joint_name: str, **overrides) -> MotorQuantization:
+    """生成一个默认宽松、可按测试覆盖单字段的电机标定夹具。"""
+
     values = {
         "slot": slot,
         "joint_name": joint_name,
@@ -52,6 +62,8 @@ def _motor(slot: int, joint_name: str, **overrides) -> MotorQuantization:
 
 
 def _configuration_payload() -> dict:
+    """生成可部署标志已关闭、8槽位齐全的最小 v2 配置对象。"""
+
     return {
         "schema": PROTOCOL_55AA_CONFIG_SCHEMA,
         "byte_order": "big",
@@ -73,6 +85,8 @@ def _configuration_payload() -> dict:
 
 
 def test_zero_frame_has_fixed_size_length_and_checksum():
+    """给定8个全零电机槽位，帧长、长度字节、48B负载、校验和帧尾应全部固定。"""
+
     frame = encode_raw_frame((RawMotorCommand(0, 0, 0),) * 8)
 
     assert PROTOCOL_55AA_FRAME_SIZE == 53
@@ -84,6 +98,8 @@ def test_zero_frame_has_fixed_size_length_and_checksum():
 
 
 def test_raw_frame_uses_fixed_motor_slots_and_firmware_big_endian_fields():
+    """给定人工编写的 uint16 黄金值，48B 负载必须按槽位1至8和大端顺序逐字节匹配。"""
+
     commands = _raw_commands()
     frame = encode_raw_frame(commands)
     expected_payload = bytes.fromhex(
@@ -213,6 +229,8 @@ def test_payload_may_contain_header_and_tail_byte_sequences():
 
 
 def test_stream_decoder_resynchronizes_after_noise_and_corrupt_frame():
+    """给定前导噪声和坏校验帧，流解码器应保留半个帧头并在下一帧恢复同步。"""
+
     first_commands = _raw_commands()
     second_commands = tuple(reversed(first_commands))
     first = encode_raw_frame(first_commands)
@@ -277,6 +295,8 @@ def test_configuration_rejects_joint_names_in_the_wrong_motor_slots():
     ),
 )
 def test_firmware_physical_minimum_zero_and_maximum_quantization(angle, velocity, acceleration, expected):
+    """固件量化公式的最小值、中点、最大值和负加速度幅值必须命中黄金端点。"""
+
     motor = _motor(
         1,
         PROTOCOL_55AA_JOINT_ORDER[0],
@@ -320,7 +340,7 @@ def test_one_radian_per_second_squared_uses_fixed_thousand_scale_and_big_endian_
 
     assert command.acceleration_limit == 1000
     assert frame[7:9] == bytes.fromhex("03 E8")
-    # Independent decoding follows the supplied C receiver rather than the codec.
+    # 这里直接照抄固件 C 接收公式独立反解，不调用 Python codec，避免两边同时写错仍通过测试。
     raw_angle = (frame[3] << 8) | frame[4]
     raw_velocity = (frame[5] << 8) | frame[6]
     raw_acceleration = (frame[7] << 8) | frame[8]
@@ -397,7 +417,11 @@ def test_configured_mode_only_substitutes_acceleration_and_keeps_signed_velocity
     ),
 )
 def test_quantization_rejects_rounding_that_crosses_a_motor_safety_limit(overrides, velocity, error):
-    """Inputs in range still fail if the receiver's quantized target is unsafe."""
+    """输入值虽在软限位内，但量化再反解后越界时仍必须拒绝发送。
+
+    这是浮点数映射到 uint16 时容易漏掉的第二道检查：真实电机执行的是固件反解值，
+    而不是量化前那个看似安全的 Python 浮点数。
+    """
 
     motor = _motor(1, PROTOCOL_55AA_JOINT_ORDER[0], **overrides)
 

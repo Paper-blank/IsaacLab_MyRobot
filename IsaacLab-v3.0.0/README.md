@@ -65,6 +65,9 @@ detailed tutorials and step-by-step guides. Follow these links to learn more abo
 
 This checkout includes a customized exoskeleton training task. For the Chinese guide covering setup, first run,
 training, and modification workflows, see [MY_EXOSKELETON_BEGINNER_GUIDE.zh-CN.md](source/isaaclab_assets/MY_EXOSKELETON_BEGINNER_GUIDE.zh-CN.md).
+For a zero-background Chinese walkthrough of the custom source code, execution flow, Tensor shapes, rewards,
+imitation data, result export, and hardware-deployment modules, see
+[MY_EXOSKELETON_CODE_GUIDE.zh-CN.md](MY_EXOSKELETON_CODE_GUIDE.zh-CN.md).
 For the 500-iteration curriculum milestones and checkpoint commands, see
 [MY_EXOSKELETON_TRAINING_GUIDE_500_ROUNDS.zh-CN.md](source/isaaclab_assets/MY_EXOSKELETON_TRAINING_GUIDE_500_ROUNDS.zh-CN.md).
 For the paper innovation mapping and complete reward inventory, see

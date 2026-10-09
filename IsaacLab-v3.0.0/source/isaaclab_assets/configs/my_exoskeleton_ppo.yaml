@@ -1,20 +1,31 @@
-# Paper-inspired recurrent PPO for the 49-D gait-conditioned actor and the
-# 62-D privileged critic. The action dimension remains eight.
+# 基础外骨骼任务的 RL-Games PPO 配置。
+#
+# 阅读方法：环境 Python 配置决定“机器人、观测、动作和奖励是什么”；本 YAML 决定
+# “神经网络长什么样、每次收集多少经验、怎样用 PPO 更新、多久保存一次”。actor 输入
+# 49 维并输出 8 个归一化关节动作；critic 使用 62 维仿真特权状态估计长期回报。
+# LSTM 让策略记住过去若干步，对只看单帧难以判断的左右腿相位很有帮助。
 seed: 42
 params:
+  # RL-Games 内部也读取 seed；固定种子便于复现实验，但 GPU 物理仍可能存在微小差异。
   seed: 42
   algo:
+    # RL-Games 沿用 a2c_continuous 名称承载连续动作 PPO 实现。
     name: a2c_continuous
   model:
+    # actor 输出动作分布均值，logstd 参数给出探索噪声标准差。
     name: continuous_a2c_logstd
   env:
+    # 进入网络前限制异常观测；离开网络后把动作限制到 [-1, 1]。环境随后按每关节
+    # scale 和默认姿态把动作换算为目标角度，这不是“当前角度上的增量”。
     clip_observations: 100.0
     clip_actions: 1.0
+    # policy 组交给 actor，critic 组只交给价值网络。
     obs_groups:
       obs: [policy]
       states: [critic]
   network:
     name: actor_critic
+    # actor/critic 共享前部网络；central value 仍会在后面使用单独的特权观测网络。
     separate: False
     space:
       continuous:
@@ -24,10 +35,12 @@ params:
           name: default
         sigma_init:
           name: const_initializer
-          # continuous_a2c_logstd exponentiates this value: exp(log(0.8)) = 0.8.
+          # continuous_a2c_logstd 会取指数：exp(-0.22314355) 约为 0.8，表示初始探索
+          # 标准差。fixed_sigma=True 时它不随每个状态单独变化。
           val: -0.22314355
         fixed_sigma: True
     mlp:
+      # 每个时间步先经过一个 32 单元全连接层，elu 提供平滑非线性。
       units: [32]
       activation: elu
       d2rl: False
@@ -36,6 +49,7 @@ params:
       regularizer:
         name: None
     rnn:
+      # 单层 64 单元 LSTM；seq_length=16 时按连续 16 个控制步反向传播。
       name: lstm
       units: 64
       layers: 1
@@ -43,47 +57,66 @@ params:
       concat_input: True
       layer_norm: False
   config:
+    # name 同时决定默认日志目录 logs/rl_games/my_exoskeleton_ppo/。
     name: my_exoskeleton_ppo
-    # Registered by Isaac Lab's RL-Games backend.
+    # rlgpu 是 Isaac Lab 向 RL-Games 注册的 GPU 向量环境名称。
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'
     multi_gpu: False
     ppo: True
+    # value_bootstrap=True：因时间上限截断时，用 critic 估计未观察到的后续回报。
     use_experimental_cv: False
     value_bootstrap: True
     reward_shaper:
       scale_value: 1.0
+    # 优势函数、学习率和 KL 散度共同决定一次更新走多大。adaptive 会在策略变化过快
+    # 或过慢时围绕 learning_rate 自动调节步长。
     normalize_advantage: True
     lr_schedule: adaptive
     schedule_type: standard
     kl_threshold: 0.01
+    # score_to_win 只用于 RL-Games 的“达到目标”判断，不是奖励函数本身。
     score_to_win: 100000
+    # 前 100 个 epoch 后才允许按最佳奖励保存；每 200 个 epoch 另存周期 checkpoint。
     save_best_after: 100
     save_frequency: 200
     print_stats: True
+    # critic_coef 控制价值误差占比；bounds_loss_coef 轻微惩罚越出动作边界的均值。
     critic_coef: 2.0
     bounds_loss_coef: 0.0001
+    # 用运行均值/方差标准化输入和价值目标。恢复 checkpoint 时也会恢复这些统计量，
+    # 因此不能只拷贝网络权重而丢掉完整 checkpoint 状态。
     normalize_input: True
     normalize_value: True
+    # num_actors 会在启动时被实际 --num_envs 覆盖；此处 4096 是生产训练默认值。
     num_actors: 4096
+    # 每个 PPO epoch 先让每个环境运行 32 个控制步。因此总样本数为
+    # num_envs * horizon_length，例如 4096 * 32 = 131072。
     horizon_length: 32
-    # 32-step rollouts make this divide both the 16-env smoke-test batch
-    # (16 * 32) and the 4096-env production batch (4096 * 32).
+    # 每次用 512 条样本做一个小批次；它能整除 16 环境冒烟测试和 4096 环境正式训练
+    # 的 rollout 总样本数。
     minibatch_size: 512
+    # LSTM 训练序列长度 16；episode 结束时清零隐藏状态，避免记忆跨回合泄漏。
     seq_length: 16
     zero_rnn_on_done: True
+    # 同一批 rollout 重复优化 5 遍。次数过大可能过拟合旧数据，过小则样本利用不足。
     mini_epochs: 5
     learning_rate: 3.0e-4
+    # gamma 是未来奖励折扣，tau 是 GAE 优势估计平滑系数，e_clip 是 PPO 概率比裁剪宽度。
     gamma: 0.99
     tau: 0.95
     e_clip: 0.2
+    # entropy_coef 鼓励探索；梯度范数最多为 1，防止偶发大梯度破坏训练。
     entropy_coef: 0.01
     clip_value: True
     truncate_grads: True
     grad_norm: 1.0
+    # 训练最多执行 30000 个 PPO epoch，不等于 30000 个单环境控制步。
     max_epochs: 30000
     central_value_config:
+      # central value 是只在训练时使用的 critic。它读取 states:[critic] 的 62 维
+      # 特权信息，actor 部署到实体机时不需要这组额外输入。
       minibatch_size: 512
       mini_epochs: 5
       learning_rate: 3.0e-4

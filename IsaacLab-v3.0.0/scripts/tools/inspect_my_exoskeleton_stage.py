@@ -35,11 +35,11 @@ for source_dir in (repo_root / "source" / "isaaclab_assets", repo_root / "source
     if str(source_dir) not in sys.path:
         sys.path.insert(0, str(source_dir))
 
-import gymnasium as gym  # noqa: E402
+import gymnasium as gym  # noqa: E402,I001
 import isaaclab_assets.my_exoskeleton  # noqa: E402,F401
 import isaaclab.sim as sim_utils  # noqa: E402
 from isaaclab.envs import ManagerBasedRLEnv  # noqa: E402
-from isaaclab.utils.dict import class_to_dict  # noqa: E402
+from isaaclab.utils.dict import class_to_dict  # noqa: E402,F401
 
 
 def main() -> None:
@@ -90,7 +90,9 @@ def main() -> None:
     for name, robot in env.scene.articulations.items():
         print("  ", name, "prim_path=", robot.cfg.prim_path)
         print("      body_names=", list(robot.body_names))
-        print("      root_paths=", list(robot.root_physx_view.prim_paths[: min(4, len(robot.root_physx_view.prim_paths))]))
+        print(
+            "      root_paths=", list(robot.root_physx_view.prim_paths[: min(4, len(robot.root_physx_view.prim_paths))])
+        )
 
     print("[inspect] sensors:")
     for name, sensor in env.scene.sensors.items():

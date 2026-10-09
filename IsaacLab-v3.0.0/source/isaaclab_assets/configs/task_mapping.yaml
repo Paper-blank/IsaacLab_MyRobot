@@ -1,3 +1,4 @@
+# 数据集任务 ID 的安装包内副本。ID 是程序接口，中文 name 是展示文本。
 version: 1
 description: Human-exoskeleton recording task identifiers.
 tasks:

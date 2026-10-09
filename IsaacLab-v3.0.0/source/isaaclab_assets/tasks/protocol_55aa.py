@@ -3,14 +3,20 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Encode and validate the eight-motor ``55 AA`` command protocol.
+"""编码和校验外骨骼 8 电机 55 AA 控制帧。
 
-The wire format is deliberately independent of Isaac Sim and Torch so the
-same implementation can be reused by a playback recorder, an industrial-PC
-process, and unit tests. Physical values are converted to unsigned 16-bit
-fields only after an explicit per-motor calibration has been loaded. Version 2
-matches the firmware's big-endian, biased signed position/velocity fields and
-unsigned acceleration magnitude. The frame itself carries no version marker.
+线路格式有意不依赖 Isaac Sim 和 Torch，所以回放记录器、工控机程序与单元测试可以
+复用同一实现。只有加载每个电机的明确标定参数后，物理量才会转换成 uint16。v2 与
+固件保持一致：大端字节序、带偏移的有符号角度/速度，以及无符号加速度幅值；帧中
+本身不携带协议版本号。
+
+新手阅读顺序：先看顶部帧常量和固定槽位，再看 encode_raw_frame 的 53 字节结构，
+最后看 MotorQuantization 如何应用零位、方向、减速比和软限位。本模块只负责
+“物理量怎样变成确定字节”，不会自行打开 CAN、EtherCAT 或串口。
+
+协议量程不等于人体或机械安全限位。编码器会在量化前检查原始物理量，并按固件公式
+反解量化整数后再次检查；任何越界都拒绝，不做静默裁剪。帧本身没有版本号，所以旧
+v1 二进制不能靠帧长或 XOR 自动识别，必须隔离并重新导出。
 """
 
 from __future__ import annotations
@@ -40,6 +46,14 @@ PROTOCOL_55AA_VELOCITY_MAX_RAD_S = 20.0
 PROTOCOL_55AA_ACCELERATION_MAX_RAD_S2 = 65.535
 PROTOCOL_55AA_ACCELERATION_RESOLUTION_RAD_S2 = 0.001
 
+# 一帧固定 53B，不能只看 length=0x32 就误认为总长 50B：
+# [0..1] 55 AA 帧头；[2] 0x32；[3..50] 8 电机 * 6B；[51] XOR；[52] 5A。
+# length 表示“长度字节之后的剩余字节数”，即 payload 48B + 校验 1B + 帧尾 1B。
+# 每个电机 6B 又依次是目标位置、带偏置的有符号目标速度、非负加速度幅值/上限，
+# 每项都是高字节在前的 uint16。此协议层不包含时间戳或电机反馈。
+
+# 下面的元组是“线路槽位顺序”，不是 actor 的右腿优先顺序。编码时必须按关节名称
+# 重排，不能把 8 维动作数组直接复制到 48 字节 payload。
 PROTOCOL_55AA_JOINT_ORDER = (
     "Lleg_to_Lfoot",
     "Rleg_to_Rfoot",
@@ -50,15 +64,18 @@ PROTOCOL_55AA_JOINT_ORDER = (
     "base_to_Lturn",
     "base_to_Rturn",
 )
-"""Fixed motor slots: left/right ankle, knee, hip, then steering joint."""
+"""固定槽位：左右踝、左右膝、左右髋屈伸、左右转向关节。"""
 
 
 class Protocol55AAError(ValueError):
-    """Raised when a protocol frame or quantization configuration is invalid."""
+    """帧结构、校验、标定或量化配置不满足协议时抛出的异常。"""
 
 
 def xor_checksum(data: bytes | bytearray | memoryview) -> int:
-    """Return the byte-wise XOR of *data*."""
+    """逐字节异或并返回 0..255 的校验值。
+
+    完整帧的校验范围是帧头、长度和 48B payload，不包括校验字节本身与帧尾。
+    """
 
     checksum = 0
     for value in data:
@@ -68,11 +85,11 @@ def xor_checksum(data: bytes | bytearray | memoryview) -> int:
 
 @dataclass(frozen=True)
 class RawMotorCommand:
-    """One motor's unsigned wire codes, not physical values.
+    """单个电机的 3 个原始 uint16 线路码，不是带单位的物理量。
 
-    ``max_speed`` is a legacy field name for the biased signed target velocity
-    in v2; use ``target_velocity`` for new readers. ``max_acceleration`` remains
-    an unsigned acceleration magnitude/limit, never a signed derivative.
+    每个字段必须是 0..65535 的整数。``max_speed`` 是旧 API 名；v2 在线路上实际表示
+    带 20 rad/s 偏置的“有符号目标速度”，新代码应通过 ``target_velocity`` 理解它。
+    ``max_acceleration`` 仍是无符号加速度幅值/上限，绝不表示负加速度方向。
     """
 
     target_position: int
@@ -80,6 +97,8 @@ class RawMotorCommand:
     max_acceleration: int
 
     def __post_init__(self) -> None:
+        """拒绝 bool、浮点数和 uint16 范围外的线路字段。"""
+
         for name in ("target_position", "max_speed", "max_acceleration"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= UINT16_MAX:
@@ -87,34 +106,37 @@ class RawMotorCommand:
 
     @property
     def target_velocity(self) -> int:
-        """Biased signed velocity code (legacy ``max_speed`` alias)."""
+        """返回带偏置的有符号速度码；这是旧字段 ``max_speed`` 的语义别名。"""
 
         return self.max_speed
 
     @property
     def acceleration_limit(self) -> int:
-        """Unsigned acceleration code (legacy ``max_acceleration`` alias)."""
+        """返回无符号加速度幅值/上限码；是 ``max_acceleration`` 的语义别名。"""
 
         return self.max_acceleration
 
 
 @dataclass(frozen=True)
 class Decoded55AAFrame:
-    """Validated raw command frame."""
+    """已经通过帧头、长度、帧尾和 XOR 校验的8电机原始帧。"""
 
     motors: tuple[RawMotorCommand, ...]
     checksum: int
 
     def __post_init__(self) -> None:
+        """确保解码结果恰好含8个电机记录。"""
+
         if len(self.motors) != PROTOCOL_55AA_MOTOR_COUNT:
             raise Protocol55AAError(f"a frame must contain {PROTOCOL_55AA_MOTOR_COUNT} motor records")
 
 
 def encode_raw_frame(motors: Sequence[RawMotorCommand]) -> bytes:
-    """Encode eight raw motor records into one 53-byte command frame.
+    """把按槽位1到8排列的原始电机记录编码为一帧固定 53B 字节串。
 
-    All 16-bit fields are big-endian, matching ``(high << 8) | low``. The checksum covers the header,
-    length byte, and 48-byte payload; it excludes the checksum byte and tail.
+    这里不做 rad 等物理量换算，只打包已经量化好的 uint16。全部 16 位字段使用大端序
+    ``高字节, 低字节``，与固件 ``(high << 8) | low`` 一致。XOR 覆盖帧头、长度和
+    48B 数据区，不覆盖 XOR 自身和帧尾。
     """
 
     records = tuple(motors)
@@ -134,7 +156,11 @@ def encode_raw_frame(motors: Sequence[RawMotorCommand]) -> bytes:
 
 
 def decode_raw_frame(frame: bytes | bytearray | memoryview) -> Decoded55AAFrame:
-    """Validate and decode one complete 53-byte command frame."""
+    """严格校验一帧完整 53B 数据，并还原8组原始 uint16 字段。
+
+    输入必须正好是一帧；CAN FD 的 64B DLC 填充或串口中相邻多帧不能直接传入，应由
+    传输适配层先去掉填充，或交给 :class:`Protocol55AAStreamDecoder` 分帧。
+    """
 
     data = bytes(frame)
     if len(data) != PROTOCOL_55AA_FRAME_SIZE:
@@ -157,26 +183,27 @@ def decode_raw_frame(frame: bytes | bytearray | memoryview) -> Decoded55AAFrame:
 
 
 class Protocol55AAStreamDecoder:
-    """Incrementally recover valid frames from a byte stream.
+    """从可能分包、粘包或夹杂坏字节的连续流中增量恢复有效帧。
 
-    Bad length, tail, or checksum values discard one candidate header byte and
-    resume scanning. Payload bytes need no escaping because the fixed length
-    determines the frame boundary.
+    串口一次 read 不保证恰好返回53字节：一帧可能分多次到达，也可能一次收到多帧。
+    ``feed`` 会保留未完成尾部；遇到错误长度、帧尾或 XOR 时只丢弃候选帧头的第一个
+    字节，再继续寻找下一个 ``55 AA``。帧长固定，因此 payload 中出现 55 AA 无需转义。
     """
 
     def __init__(self) -> None:
+        """创建空接收缓存；同一通讯连接应持续复用这个实例。"""
+
         self._buffer = bytearray()
 
     def feed(self, data: bytes | bytearray | memoryview) -> list[Decoded55AAFrame]:
-        """Append stream bytes and return every newly completed valid frame."""
+        """追加本次收到的任意长度字节，并返回其中新完成的全部有效帧。"""
 
         self._buffer.extend(data)
         frames: list[Decoded55AAFrame] = []
         while True:
             header_index = self._buffer.find(PROTOCOL_55AA_HEADER)
             if header_index < 0:
-                # Retain a trailing 0x55 because it may be the first byte of a
-                # header split across two reads.
+                # 保留末尾单独的0x55：它可能是一次跨两次read到达的帧头第一个字节。
                 trailing_header_byte = bool(self._buffer and self._buffer[-1] == PROTOCOL_55AA_HEADER[0])
                 self._buffer[:] = self._buffer[-1:] if trailing_header_byte else b""
                 break
@@ -202,12 +229,14 @@ class Protocol55AAStreamDecoder:
 
     @property
     def buffered_bytes(self) -> int:
-        """Number of incomplete bytes retained for the next call."""
+        """当前为下一次 ``feed`` 保留的未完成字节数。"""
 
         return len(self._buffer)
 
 
 def _finite_number(value: Any, label: str) -> float:
+    """把配置值转为有限浮点数；显式拒绝可被 Python 当作整数的 bool。"""
+
     if isinstance(value, bool):
         raise Protocol55AAError(f"{label} must be a finite number")
     try:
@@ -220,6 +249,8 @@ def _finite_number(value: Any, label: str) -> float:
 
 
 def _check_range(value: float, minimum: float, maximum: float, label: str) -> None:
+    """检查物理量位于闭区间内；越界立即报错而不是裁剪。"""
+
     if not math.isfinite(value):
         raise Protocol55AAError(f"{label} must be finite")
     if value < minimum or value > maximum:
@@ -227,27 +258,31 @@ def _check_range(value: float, minimum: float, maximum: float, label: str) -> No
 
 
 def _quantize(value: float, minimum: float, maximum: float, label: str) -> int:
+    """把闭区间物理量线性映射到 uint16，并使用明确的四舍五入规则。"""
+
     _check_range(value, minimum, maximum, label)
     normalized = (value - minimum) / (maximum - minimum)
-    # Round-half-up is explicit and is identical on every Python platform.
+    # 显式采用 round-half-up，确保所有 Python 平台得到完全相同的量化结果。
     return min(UINT16_MAX, max(0, int(math.floor(normalized * UINT16_MAX + 0.5))))
 
 
 @dataclass(frozen=True)
 class MotorQuantization:
-    """Calibration and motor-side safety limits for one fixed slot.
+    """一个固定电机槽位的关节到电机标定、量化和软安全限制。
 
-    Position is first converted from the simulation joint to motor-side angle:
-    ``q_motor = zero_offset + direction * gear_ratio * q_joint`` [rad]. The
-    velocity target is ``direction * gear_ratio * v_joint`` [rad/s], preserving
-    its sign. Acceleration is an unsigned magnitude [rad/s^2].
+    编码前只做一次关节侧到电机侧换算：
 
-    The firmware quantization ranges are fixed; ``position_min_rad`` and
-    ``position_max_rad`` are tighter safety limits, not configurable scales.
-    ``command_max_velocity_rad_s`` and ``command_max_acceleration_rad_s2`` are
-    optional, tighter magnitude limits in ``trajectory`` mode. ``configured``
-    mode requires both limits and sends the fixed acceleration limit, while
-    still sending the signed trajectory velocity (never a fixed speed).
+    * ``q_motor = zero_offset + direction * gear_ratio * q_joint`` [rad]；
+    * ``v_motor = direction * gear_ratio * v_joint`` [rad/s]，保留正负方向；
+    * ``a_motor = gear_ratio * abs(a_joint)`` [rad/s^2]，线路只传幅值/上限。
+
+    ``slot`` 决定48B数据区位置，``joint_name`` 决定从公共关节向量取哪个值。
+    ``position_min_rad``/``position_max_rad`` 是经过实机审核的电机侧软限位，不会改变
+    固件固定的 ±12.57 rad 编码量程。速度固定编码范围为 ±20 rad/s，加速度固定为
+    0..65.535 rad/s^2；``command_max_*`` 只能进一步收紧它们。
+
+    ``trajectory`` 模式发送轨迹自身的加速度幅值；``configured`` 模式发送审核过的固定
+    加速度上限。两种模式的速度字段都始终是带符号轨迹目标速度，绝不是固定最大速度。
     """
 
     slot: int
@@ -264,6 +299,8 @@ class MotorQuantization:
     command_max_acceleration_rad_s2: float | None = None
 
     def __post_init__(self) -> None:
+        """验证槽位、标定、固定固件量程和可选安全上限之间的一致性。"""
+
         if (
             isinstance(self.slot, bool)
             or not isinstance(self.slot, int)
@@ -318,7 +355,7 @@ class MotorQuantization:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any], *, default_limit_source: str = "trajectory") -> MotorQuantization:
-        """Build one motor configuration from a JSON object."""
+        """从配置 JSON 中的一项构造并验证一个电机槽位。"""
 
         try:
             return cls(
@@ -343,11 +380,16 @@ class MotorQuantization:
             raise Protocol55AAError(f"invalid motor configuration: {exc}") from exc
 
     def encode(self, angle_rad: float, velocity_rad_s: float, acceleration_rad_s2: float) -> RawMotorCommand:
-        """Quantize joint angle [rad], signed speed [rad/s], and acceleration [rad/s^2].
+        """标定并量化一个关节的角度、带符号速度和角加速度。
 
-        All calibrated values are checked before rounding. The acceleration
-        field carries only the magnitude/limit; a negative derivative is not
-        a negative wire command. No out-of-range input is silently clipped.
+        输入依次为关节侧角度 [rad]、速度 [rad/s]、角加速度 [rad/s^2]。先应用零位、
+        方向和减速比，再检查电机侧软限位并量化。量化完成后还会按固件公式反解一次，
+        再检查反解值是否仍在更紧的软限位内；这是为了防止整数舍入把一个边界内输入
+        推到边界外。任何失败都抛错，不静默截断。
+
+        加速度在线路上只携带非负幅值/上限，所以负导数会先取绝对值；速度则保留符号。
+        由于 65535 为奇数，中间码无法精确表示 0 rad 或 0 rad/s，软限位必须为量化和
+        固件 float32 反解保留余量。
         """
 
         angle = _finite_number(angle_rad, f"{self.joint_name} angle_rad")
@@ -386,8 +428,7 @@ class MotorQuantization:
             ),
             max_acceleration=int(math.floor(motor_acceleration * 1000.0 + 0.5)),
         )
-        # Rounding must not push the actual receiver target past a tighter
-        # safety limit. A zero velocity cannot be represented exactly.
+        # 四舍五入不能让接收端实际目标越过更严格的安全限位；速度零无法被精确表示。
         _check_range(
             self.decode_position_rad(command.target_position),
             self.position_min_rad,
@@ -409,19 +450,19 @@ class MotorQuantization:
         return command
 
     def decode_position_rad(self, raw_position: int) -> float:
-        """Convert one raw target-position value back to motor-side radians."""
+        """按固件公式把位置码反解为电机侧角度 [rad]。"""
 
         RawMotorCommand(raw_position, 0, 0)
         return (raw_position / UINT16_MAX) * 25.14 - 12.57
 
     def decode_velocity_rad_s(self, raw_velocity: int) -> float:
-        """Decode the motor-side signed velocity [rad/s], matching the firmware."""
+        """按固件公式把偏置速度码反解为电机侧有符号速度 [rad/s]。"""
 
         RawMotorCommand(0, raw_velocity, 0)
         return (raw_velocity / UINT16_MAX) * 40.0 - 20.0
 
     def decode_acceleration_rad_s2(self, raw_acceleration: int) -> float:
-        """Decode the unsigned acceleration magnitude/limit [rad/s^2]."""
+        """按 ``raw/1000`` 反解无符号加速度幅值/上限 [rad/s^2]。"""
 
         RawMotorCommand(0, 0, raw_acceleration)
         return raw_acceleration / 1000.0
@@ -429,11 +470,13 @@ class MotorQuantization:
 
 @dataclass(frozen=True)
 class Protocol55AAConfig:
-    """Complete fixed-order eight-motor quantization configuration."""
+    """完整的8电机槽位、标定和安全量化配置。"""
 
     motors: tuple[MotorQuantization, ...]
 
     def __post_init__(self) -> None:
+        """强制槽位恰为1..8、关节不重复且顺序符合线路协议。"""
+
         ordered = tuple(sorted(self.motors, key=lambda motor: motor.slot))
         if len(ordered) != PROTOCOL_55AA_MOTOR_COUNT:
             raise Protocol55AAError(f"configuration must contain {PROTOCOL_55AA_MOTOR_COUNT} motors")
@@ -451,7 +494,12 @@ class Protocol55AAConfig:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> Protocol55AAConfig:
-        """Load and validate a configuration mapping."""
+        """从已解析 JSON 对象加载 v2 配置并执行完整一致性检查。
+
+        v1 使用不兼容的小端/可变量程，因此明确拒绝。``example_only=true`` 的模板也会
+        被拒绝，必须复制后填入实测软限位、零位、方向、减速比与指令上限，并由人员
+        审核后才能改为 false。
+        """
 
         schema = str(payload.get("schema", ""))
         if schema != PROTOCOL_55AA_CONFIG_SCHEMA:
@@ -491,7 +539,7 @@ class Protocol55AAConfig:
 
     @classmethod
     def from_file(cls, path: str | Path) -> Protocol55AAConfig:
-        """Load a JSON protocol configuration file."""
+        """从磁盘读取 JSON 协议配置，并交给 :meth:`from_mapping` 严格验证。"""
 
         config_path = Path(path).expanduser()
         try:
@@ -504,7 +552,7 @@ class Protocol55AAConfig:
 
     @property
     def joint_names(self) -> tuple[str, ...]:
-        """Source joint names in fixed motor-slot order."""
+        """返回按电机槽位1到8排列的源关节名称。"""
 
         return tuple(motor.joint_name for motor in self.motors)
 
@@ -515,7 +563,12 @@ class Protocol55AAConfig:
         velocity_rad_s: Sequence[float],
         acceleration_rad_s2: Sequence[float],
     ) -> bytes:
-        """Select eight named joints, quantize them, and return one wire frame."""
+        """按关节名称选值、重排到槽位1..8、逐电机标定，最后返回一帧53B数据。
+
+        输入的 ``joint_names`` 可以采用策略公共顺序，不要求已经按电机号排列；角度、
+        速度、加速度三个向量必须与它等长且使用 rad、rad/s、rad/s^2。按名称映射而非
+        直接按下标复制，是为了正确处理“策略右腿优先、协议左右交错”的顺序差异。
+        """
 
         names = tuple(str(name) for name in joint_names)
         if len(set(names)) != len(names):
@@ -535,6 +588,8 @@ class Protocol55AAConfig:
 
 
 def _raise_invalid_motor(index: int) -> MotorQuantization:
+    """把电机数组中“不是 JSON 对象”的位置转换为带下标的明确异常。"""
+
     raise Protocol55AAError(f"motors[{index}] must be a JSON object")
 
 

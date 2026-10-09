@@ -1,15 +1,17 @@
+# 安装包内的坐标标定副本：output_vector = matrix @ dataset_vector。
+# 单位不会在这里转换；本文件只处理关节符号和三维坐标轴。
 version: 2
 description: Direction calibration from the recorded exoskeleton channels to the Isaac Lab articulation frame.
 coordinate_calibration:
   joint_sign: [1, 1, -1, 1, 1, -1, 1, 1]
-  # Recorder order: 01/02 ankle, 03/04 knee, 05/06 hip; odd IDs are left.
+  # 采集顺序：01/02 踝、03/04 膝、05/06 髋；奇数在左侧、偶数在右侧。
   imu_sensor_sides: [left, right, left, right, left, right]
-  # Rows are output (joint) axes; columns are input (dataset) axes.
+  # 矩阵的行是输出（关节）轴，列是输入（数据集）轴。
   imu_axis_transforms:
     right: [[0, 1, 0], [1, 0, 0], [0, 0, -1]]
     left: [[0, -1, 0], [1, 0, 0], [0, 0, -1]]
-  # R_exo = R_joint_link @ R_link_sensor @ R_sensor_IMU. Mounting poses are
-  # unknown in the supplied data and therefore default to identity.
+  # 完整旋转链：R_exo = R_joint_link @ R_link_sensor @ R_sensor_IMU。
+  # 当前数据没有提供实测安装姿态，所以两层安装旋转暂用单位矩阵，实体采集后应替换。
   R_joint_link:
     default: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
   R_link_sensor:

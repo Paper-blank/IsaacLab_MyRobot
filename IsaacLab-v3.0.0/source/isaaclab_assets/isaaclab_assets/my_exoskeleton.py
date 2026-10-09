@@ -22,9 +22,7 @@ IMITATION_TASK_ID = "Isaac-MyExoskeleton-Imitation-v0"
 _source_root = Path(__file__).resolve().parents[1]
 _cfg_entry_point = "isaaclab_assets.envs.my_exoskeleton_env_cfg:MyExoskeletonFlatEnvCfg"
 _ppo_entry_point = str(_source_root / "configs" / "my_exoskeleton_ppo.yaml")
-_imitation_cfg_entry_point = (
-    "isaaclab_assets.envs.my_exoskeleton_imitation_env_cfg:MyExoskeletonImitationEnvCfg"
-)
+_imitation_cfg_entry_point = "isaaclab_assets.envs.my_exoskeleton_imitation_env_cfg:MyExoskeletonImitationEnvCfg"
 _imitation_env_entry_point = "isaaclab_assets.tasks.my_exoskeleton_imitation:MyExoskeletonImitationEnv"
 _imitation_ppo_entry_point = str(_source_root / "configs" / "my_exoskeleton_imitation_ppo.yaml")
 

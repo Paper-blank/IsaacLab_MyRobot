@@ -3,7 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Unit tests for the my_exoskeleton playback and training entrypoints."""
+"""外骨骼训练/播放入口脚本的命令行参数回归测试。
+
+这里不启动策略或仿真，而是验证用户输入如何被安全地翻译：``--task_id``、数据集路径、
+传感器开关、诊断和 ruleresult 参数必须变成正确 Hydra 覆盖项，且不能泄漏给后端
+parser。还保护相对输出路径锚定启动目录、互斥参数尽早报错，以及 Isaac Sim USD 运行
+库必须在导入 Isaac Lab 前完成 bootstrap 的启动顺序。
+"""
 
 from __future__ import annotations
 
@@ -13,6 +19,7 @@ from pathlib import Path
 import pytest
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[3] / "scripts" / "play_my_exoskeleton.py"
+# 给定入口脚本路径，直接以模块方式加载；这样可以只测试参数转换函数，不运行 main。
 _SPEC = importlib.util.spec_from_file_location("play_my_exoskeleton", _SCRIPT_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -26,7 +33,7 @@ _TRAIN_SPEC.loader.exec_module(_TRAIN_MODULE)
 
 
 def test_show_imu_enables_all_sensor_debug_overrides_for_kit():
-    """The convenience flag should stay scoped to one visible Kit environment."""
+    """便捷可视化参数应只作用于一个可见的 Kit 环境。"""
     argv = _MODULE._enable_imu_probes(["--num_envs=1", "--visualizer", "kit", "--show-imu"])
 
     assert "--show-imu" not in argv
@@ -41,13 +48,17 @@ def test_show_imu_enables_all_sensor_debug_overrides_for_kit():
     ],
 )
 def test_show_imu_rejects_unsupported_playback_modes(argv, message):
-    """Probe telemetry is meaningful only in the interactive one-env inspection flow."""
+    """探针遥测只在交互式单环境检查流程中有明确含义。"""
     with pytest.raises(ValueError, match=message):
         _MODULE._enable_imu_probes(argv)
 
 
 def test_usd_bootstrap_reexecs_with_kit_runtime_paths(tmp_path, monkeypatch):
-    """The Kit USD runtime should be selected before Isaac Lab imports are evaluated."""
+    """给定可发现的 Kit USD 目录，入口应补齐运行库路径并只重新执行进程一次。
+
+    ``execvpe`` 在测试中被替换为记录参数的假函数，所以不会真的重启 pytest；断言检查
+    新路径排在用户已有环境变量之前，同时仍保留原来的路径。
+    """
     site_packages = tmp_path / "site-packages"
     usd_root = site_packages / "isaacsim" / "extscache" / "omni.usd.libs-test"
     (usd_root / "pxr").mkdir(parents=True)
@@ -78,7 +89,7 @@ def test_usd_bootstrap_reexecs_with_kit_runtime_paths(tmp_path, monkeypatch):
 
 
 def test_usd_bootstrap_guard_avoids_reexec(monkeypatch):
-    """A restarted process must not recursively restart itself."""
+    """已经重启过的进程不得再次递归重启自身。"""
     monkeypatch.setenv(_MODULE._KIT_USD_BOOTSTRAP_ENV, "1")
 
     def fail_execvpe(*_args, **_kwargs):
@@ -90,7 +101,7 @@ def test_usd_bootstrap_guard_avoids_reexec(monkeypatch):
 
 @pytest.mark.parametrize("module", [_MODULE, _TRAIN_MODULE])
 def test_convenience_task_and_dataset_flags_become_backend_safe_overrides(module):
-    """Custom aliases must be consumed before RL-Games forwards arguments to Hydra."""
+    """自定义参数别名必须先被脚本消费，不能让 RL-Games 把它们转发给 Hydra。"""
     argv = module._consume_exoskeleton_cli_args(
         [
             "--task_id=Isaac-MyExoskeleton-Flat-v0",
@@ -110,7 +121,7 @@ def test_convenience_task_and_dataset_flags_become_backend_safe_overrides(module
 
 @pytest.mark.parametrize("module", [_MODULE, _TRAIN_MODULE])
 def test_convenience_cli_rejects_conflicting_selectors(module):
-    """Ambiguous task or dataset sources should fail before Kit starts."""
+    """任务或数据集来源存在歧义时，应在 Kit 启动前直接报错。"""
     with pytest.raises(ValueError, match="different tasks"):
         module._consume_exoskeleton_cli_args(["--task", "Isaac-MyExoskeleton-Flat-v0", "--task_id", "other-task"])
     with pytest.raises(ValueError, match="dataset selector conflicts"):
@@ -124,7 +135,7 @@ def test_convenience_cli_rejects_conflicting_selectors(module):
 
 @pytest.mark.parametrize("module", [_MODULE, _TRAIN_MODULE])
 def test_dataset_task_id_is_an_imitation_selector(module):
-    """BT/AT IDs select recordings while --task remains the Gym environment."""
+    """BT/AT 编号用于选择记录，``--task`` 仍只表示 Gym 环境。"""
     argv = module._consume_exoskeleton_cli_args(
         [
             "--task",
@@ -145,7 +156,7 @@ def test_dataset_task_id_is_an_imitation_selector(module):
 
 @pytest.mark.parametrize("module", [_MODULE, _TRAIN_MODULE])
 def test_sensor_switches_are_consumed_as_environment_overrides(module):
-    """Both entrypoints accept equals and spaced boolean sensor switches."""
+    """训练和回放入口都应接受等号式与空格分隔式传感器布尔参数。"""
 
     argv = module._consume_sensor_cli_args(
         [
@@ -172,14 +183,14 @@ def test_sensor_switches_are_consumed_as_environment_overrides(module):
 
 @pytest.mark.parametrize("module", [_MODULE, _TRAIN_MODULE])
 def test_sensor_switches_default_to_environment_configuration(module):
-    """No switch means no override, preserving config defaults (all enabled)."""
+    """未提供开关就不生成覆盖，从而保留配置默认值（全部启用）。"""
 
     assert module._consume_sensor_cli_args(["--headless"]) == ["--headless"]
 
 
 @pytest.mark.parametrize("module", [_MODULE, _TRAIN_MODULE])
 def test_disabled_imitation_camera_switches_remove_camera_entities_before_launch(module):
-    """Disabled RGB/Event channels must not trigger launcher camera rendering."""
+    """关闭 RGB/Event 通道后，启动器不得再启用相机渲染。"""
 
     argv = [
         "--task",
@@ -200,7 +211,7 @@ def test_disabled_imitation_camera_switches_remove_camera_entities_before_launch
 
 @pytest.mark.parametrize("module", [_MODULE, _TRAIN_MODULE])
 def test_disabled_camera_switches_do_not_mutate_legacy_flat_task(module):
-    """The flat task has no camera entities and keeps its normal Hydra args."""
+    """普通平地任务没有相机实体，应保留原本的 Hydra 参数。"""
 
     argv = ["--task", "Isaac-MyExoskeleton-Flat-v0", "env.use_rgb=False"]
     assert module._apply_sensor_scene_overrides(argv) == argv
@@ -222,7 +233,7 @@ def test_sensor_switch_rejects_invalid_and_conflicting_values(module):
 
 
 def test_diagnostics_flags_become_imitation_environment_overrides():
-    """Playback telemetry flags stay out of the RL-Games parser."""
+    """回放遥测参数不得进入 RL-Games 参数解析器。"""
 
     argv = _MODULE._consume_diagnostics_args(
         [
@@ -252,7 +263,7 @@ def test_diagnostics_interval_rejects_non_positive_values():
 
 
 def test_ruleresult_flags_become_environment_overrides():
-    """Playback can request the structured 24-value joint result without Hydra seeing custom flags."""
+    """回放可请求结构化 24 维关节结果，同时不让 Hydra 看见自定义参数。"""
 
     argv = _MODULE._consume_ruleresult_args(
         [
@@ -281,7 +292,7 @@ def test_ruleresult_flags_become_environment_overrides():
 
 
 def test_ruleresult_relative_output_is_anchored_to_launch_directory(tmp_path, monkeypatch):
-    """A relative output path must not be rebased under the checkpoint log directory."""
+    """给定相对输出路径，应以用户启动命令的目录为基准，而不是 checkpoint 目录。"""
     monkeypatch.chdir(tmp_path)
 
     argv = _MODULE._consume_ruleresult_args(["--ruleresult-output", "logs/ruleresult.jsonl"])
@@ -293,7 +304,7 @@ def test_ruleresult_relative_output_is_anchored_to_launch_directory(tmp_path, mo
 
 
 def test_ruleresult_protocol_flags_become_environment_overrides(tmp_path, monkeypatch):
-    """Binary output options must be consumed before the RL-Games parser sees them."""
+    """二进制协议参数应先转为环境覆盖项，不能继续传给不认识它们的 RL-Games parser。"""
     monkeypatch.chdir(tmp_path)
 
     argv = _MODULE._consume_ruleresult_args(
@@ -351,7 +362,7 @@ def test_ruleresult_prediction_flags_validate_values():
 
 
 def test_train_entrypoint_bootstraps_kit_usd_before_imports(tmp_path, monkeypatch):
-    """Training must select the same Kit USD runtime as playback."""
+    """训练入口必须选择与回放入口相同的 Kit USD 运行时。"""
     site_packages = tmp_path / "site-packages"
     usd_root = site_packages / "isaacsim" / "extscache" / "omni.usd.libs-test"
     (usd_root / "pxr").mkdir(parents=True)

@@ -1,3 +1,5 @@
+# 本文件把采集文件中的 IMU 编号映射到人体部位和仿真连杆。
+# aliases 是数据源可能使用的同义名称，不会创建新的传感器。
 version: 1
 description: Six retained IMUs in recorder order (ankle 01/02, knee 03/04, hip 05/06).
 imu_mapping:
@@ -31,4 +33,5 @@ imu_mapping:
     robot_link: right_thigh
     role: "右髋关节/大腿近端"
     aliases: [Rthigh, r_thigh, thigh_right, hip_right, right_hip]
+# 这些采集通道不进入当前 6 IMU 策略输入；保留声明可避免被误当成漏读。
 ignored_imus: [imu_07, imu_08, imu_09, imu_10, imu_11]

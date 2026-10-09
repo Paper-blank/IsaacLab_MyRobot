@@ -3,7 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Tests for the optional sensor-reference trajectory contract."""
+"""基础平地任务可选单轨迹传感器参考的回归测试。
+
+本文件保护不规则时间记录重采样到50 Hz、零位/方向标定只应用一次，以及并行环境拥有
+独立播放游标。它针对旧式单文件 ``SensorReferenceBuffer``；多模态目录数据集由
+``test_imitation_dataset.py`` 单独覆盖。
+"""
 
 import torch
 
@@ -11,7 +16,7 @@ from isaaclab_assets.tasks.sensor_reference import SensorReferenceBuffer, load_s
 
 
 def test_sensor_reference_pt_is_resampled_and_calibrated(tmp_path):
-    """Continuous channels align to 50 Hz and encoder metadata is applied once."""
+    """给定0、10、30 ms的不规则样本，连续通道应重采样到50 Hz且编码器标定只应用一次。"""
     path = tmp_path / "reference.pt"
     torch.save(
         {
@@ -36,7 +41,7 @@ def test_sensor_reference_pt_is_resampled_and_calibrated(tmp_path):
 
 
 def test_sensor_reference_buffer_assigns_independent_cursors(tmp_path):
-    """Each parallel environment can start at a different reference phase."""
+    """给定三个并行环境，每个环境拥有独立游标，推进时都按自己的相位循环取样。"""
     path = tmp_path / "reference.pt"
     torch.save({"joint_pos_rad": torch.arange(32, dtype=torch.float32).reshape(4, 8)}, path)
     reference = load_sensor_reference(path, target_dt_s=0.02)

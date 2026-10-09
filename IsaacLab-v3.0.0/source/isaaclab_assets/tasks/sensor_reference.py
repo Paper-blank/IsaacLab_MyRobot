@@ -3,13 +3,20 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""On-device reference trajectories for optional sensor-imitation rewards.
+"""为可选传感器模仿奖励提供驻留设备端的参考轨迹。
 
-The loader intentionally accepts a small, explicit schema instead of trying to
-parse a ROS bag inside the simulator.  Convert a recording offline, validate
-its units and joint order, and pass an ``.npz`` or ``.pt`` file to the command
-configuration.  The resulting tensors are sampled without filesystem access
-while an episode is running.
+这个轻量通道用于已经整理成单条时间序列的参考数据，不在仿真进程里解析 ROS bag。
+输入支持 NPZ、PyTorch、JSON 和 CSV；必需的八关节角以及可选速度、六路陀螺仪、
+左右接触和 gait 标签会先在 CPU 上校验并重采样，然后一次性移动到仿真设备。
+`joint_zero_rad` 和 `joint_sign` 只校正关节位置；文件自带的可选速度保持原值，不会自动乘
+`joint_sign`。如果原始速度也在编码器坐标系中，调用方必须在入口前按同一方向规则转换。
+
+``SensorReferenceBuffer`` 为每个并行环境保存一个独立整数游标 ``indices[N]``。episode
+reset 可以只重置部分环境并选择随机起点；每个控制步统一前进，循环模式越过末尾回到
+开头，非循环模式保持最后一帧。运行期间采样只做张量索引，不再访问文件系统。
+
+该模块和完整多模态 ``imitation_dataset.py`` 用途不同：这里读取一个已整理参考文件；
+后者负责从多层 trial 目录中同步 IMU、视频和事件记录。
 """
 
 from __future__ import annotations
@@ -27,16 +34,16 @@ from .robot_contract import ACTUATED_JOINT_NAMES, CONTROL_DT_S
 
 
 class SensorReferenceFormatError(ValueError):
-    """Raised when a reference recording does not satisfy the expected schema."""
+    """表示参考记录不满足字段、shape、时间或有限值契约。"""
 
 
 @dataclass(frozen=True)
 class SensorReference:
-    """A time-aligned sensor trajectory stored as tensors.
+    """以 Torch 张量保存的一条时间对齐参考轨迹。
 
-    All tensors use the canonical right-leg-then-left-leg order.  Time is in
-    seconds, joint angles in radians, joint rates and gyros in rad/s, and
-    contact values are normalized to ``[0, 1]``.
+    所有字段第一维都是时间 ``T``，关节采用 canonical 右腿后左腿顺序。``t_s[T]``
+    单位秒，``joint_pos_rad[T,8]`` 单位 rad；可选速度 ``[T,8]`` 和陀螺仪
+    ``[T,6,3]`` 单位 rad/s，接触 ``[T,2]`` 归一化到 ``[0,1]``，gait 为 ``[T]``。
     """
 
     t_s: torch.Tensor
@@ -48,10 +55,23 @@ class SensorReference:
 
     @property
     def length(self) -> int:
+        """返回参考轨迹的时间样本数 ``T``。"""
+
         return int(self.joint_pos_rad.shape[0])
 
     def sample(self, indices: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Gather samples for environment indices, wrapping at the trajectory end."""
+        """按每环境游标收集参考帧，并在轨迹末尾取模。
+
+        Args:
+            indices: 一维整数张量 ``[N]``，每项是一个环境的当前参考帧。
+
+        Returns:
+            字典中的必需关节角 shape 为 ``[N,8]``；其余只在源轨迹存在时返回，第一维
+            同样为 ``N``。
+
+        Raises:
+            ValueError: ``indices`` 不是一维。
+        """
 
         if indices.ndim != 1:
             raise ValueError(f"reference indices must be one-dimensional, got {tuple(indices.shape)}")
@@ -67,9 +87,20 @@ class SensorReference:
 
 
 class SensorReferenceBuffer:
-    """A trajectory plus per-environment playback cursors."""
+    """一条共享轨迹及每个并行环境独立的播放游标。"""
 
     def __init__(self, reference: SensorReference, device: torch.device, loop: bool = True):
+        """把参考张量移到目标设备，并创建尚未分配环境数的游标。
+
+        Args:
+            reference: 至少两个时间样本的已校验轨迹。
+            device: 训练环境使用的 CPU/CUDA 设备。
+            loop: 是否循环播放；为 ``False`` 时游标最终停在末帧。
+
+        Raises:
+            SensorReferenceFormatError: 轨迹少于两个样本。
+        """
+
         if reference.length < 2:
             raise SensorReferenceFormatError("reference trajectory must contain at least two samples")
         self.reference = _to_device(reference, device)
@@ -85,17 +116,35 @@ class SensorReferenceBuffer:
         target_dt_s: float = CONTROL_DT_S,
         loop: bool = True,
     ) -> SensorReferenceBuffer:
-        """Load and resample one recording for the policy control period."""
+        """读取一条记录，按策略周期重采样并创建缓冲区。
+
+        Args:
+            path: NPZ、PT/PTH、JSON 或 CSV 文件。
+            device: 缓冲区所在设备。
+            target_dt_s: 策略控制周期 [s]。
+            loop: 是否循环播放。
+
+        Returns:
+            已可供环境 reset/step 使用的缓冲区。
+        """
 
         reference = load_sensor_reference(path, target_dt_s=target_dt_s)
         return cls(reference, device=device, loop=loop)
 
     @property
     def length(self) -> int:
+        """返回共享参考轨迹的时间样本数 ``T``。"""
+
         return self.reference.length
 
     def reset(self, env_ids: torch.Tensor | slice, num_envs: int, random_start: bool = False) -> None:
-        """Reset selected cursors, optionally choosing random trajectory starts."""
+        """只重置指定环境的游标，可为每个环境独立随机起点。
+
+        Args:
+            env_ids: 要重置的环境 ID 一维张量或 slice。
+            num_envs: 当前并行环境总数；变化时会重新分配 ``indices[num_envs]``。
+            random_start: ``True`` 时每个所选环境均匀随机选择 ``[0,T)`` 起点，否则归零。
+        """
 
         if self.indices.numel() == 0 or self.indices.shape[0] != num_envs:
             self.indices = torch.zeros(num_envs, dtype=torch.long, device=self.device)
@@ -110,7 +159,14 @@ class SensorReferenceBuffer:
                 self.indices[ids] = 0
 
     def advance(self, steps: int = 1) -> None:
-        """Advance all cursors by a number of policy samples."""
+        """让全部已分配环境的游标前进若干策略样本。
+
+        Args:
+            steps: 非负整数步数。
+
+        Raises:
+            ValueError: ``steps`` 为负数。
+        """
 
         if steps < 0:
             raise ValueError("reference playback steps must be non-negative")
@@ -122,7 +178,7 @@ class SensorReferenceBuffer:
             self.indices.add_(steps).clamp_max_(self.length - 1)
 
     def sample(self) -> dict[str, torch.Tensor] | None:
-        """Return the current per-environment reference sample."""
+        """返回全部环境当前参考帧；尚未 reset 分配游标时返回 ``None``。"""
 
         if self.indices.numel() == 0:
             return None
@@ -130,13 +186,26 @@ class SensorReferenceBuffer:
 
 
 def load_sensor_reference(path: str | Path, target_dt_s: float = CONTROL_DT_S) -> SensorReference:
-    """Load, calibrate, validate, and resample a sensor recording.
+    """读取、标定、校验并重采样一条参考记录。
 
-    Supported files are ``.npz``, ``.pt``/``.pth``, ``.json`` and CSV.  The
-    required field is ``joint_pos_rad`` with shape ``[T, 8]``.  Optional fields
-    are ``t_s``, ``joint_vel_rad_s`` ``[T, 8]``, ``gyro_rad_s`` ``[T, 6, 3]``,
-    ``contact_lr`` ``[T, 2]`` and ``gait_id`` ``[T]``.  A recording may include
-    ``joint_zero_rad`` and ``joint_sign`` metadata for encoder calibration.
+    支持 ``.npz``、``.pt/.pth``、``.json`` 和 CSV。必需字段是
+    ``joint_pos_rad[T,8]``；可选字段为 ``t_s[T]``、速度 ``[T,8]``、陀螺仪
+    ``[T,6,3]``、接触 ``[T,2]`` 和 gait ``[T]``。文件可附带八个
+    ``joint_zero_rad`` 和 ``joint_sign`` 完成关节位置的编码器零位/方向标定。
+    可选 ``joint_vel_rad_s`` 目前只做 shape、有限值与重采样检查，不会自动应用
+    ``joint_sign``；速度的坐标约定必须由数据制作方事先统一。
+
+    Args:
+        path: 参考文件路径。
+        target_dt_s: 输出时间间隔 [s]，连续量线性插值、gait 标签最近邻采样。
+
+    Returns:
+        时间从零开始、按 ``target_dt_s`` 重采样的 CPU :class:`SensorReference`。
+
+    Raises:
+        ValueError: ``target_dt_s`` 不为正数。
+        FileNotFoundError: 文件不存在。
+        SensorReferenceFormatError: 扩展名、字段、shape、时间顺序或数值不合法。
     """
 
     if target_dt_s <= 0.0:
@@ -150,18 +219,27 @@ def load_sensor_reference(path: str | Path, target_dt_s: float = CONTROL_DT_S) -
 
 
 def _read_payload(path: Path) -> Mapping[str, Any]:
+    """按扩展名读取文件为字段映射，暂不解释张量语义。
+
+    PyTorch 文件优先使用 ``weights_only=True``，NPZ 禁止 pickle，避免为读取纯数值
+    参考数据执行任意对象反序列化。
+
+    Raises:
+        SensorReferenceFormatError: 格式不支持或文件顶层不是映射/object。
+    """
+
     suffix = path.suffix.lower()
     if suffix == ".npz":
         try:
             import numpy as np
-        except ImportError as exc:  # pragma: no cover - Isaac Lab normally supplies numpy
+        except ImportError as exc:  # pragma: no cover - Isaac Lab 通常已提供 NumPy
             raise SensorReferenceFormatError(".npz reference files require numpy") from exc
         with np.load(path, allow_pickle=False) as archive:
             return {key: archive[key] for key in archive.files}
     if suffix in {".pt", ".pth"}:
         try:
             payload = torch.load(path, map_location="cpu", weights_only=True)
-        except TypeError:  # torch versions before the weights_only argument
+        except TypeError:  # 兼容尚未提供 weights_only 参数的旧版 PyTorch
             payload = torch.load(path, map_location="cpu")
         if not isinstance(payload, Mapping):
             raise SensorReferenceFormatError(".pt reference files must contain a mapping")
@@ -178,7 +256,15 @@ def _read_payload(path: Path) -> Mapping[str, Any]:
 
 
 def _read_csv(path: Path) -> Mapping[str, Any]:
-    """Read the compact column form used by the data-preparation guide."""
+    """读取数据准备指南约定的紧凑 CSV 列格式。
+
+    关节列支持 ``field[0]``、``field_0`` 和 ``field0`` 三种编号形式；六路三轴陀螺仪
+    在 CSV 中铺平成 18 列，返回映射前恢复为 ``[T,6,3]``。
+
+    Raises:
+        SensorReferenceFormatError: 文件无数据行或缺少八个必需关节角列。
+        ValueError: 某个存在的数值单元无法转换为浮点数。
+    """
 
     with path.open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
@@ -187,6 +273,8 @@ def _read_csv(path: Path) -> Mapping[str, Any]:
     columns = list(rows[0])
 
     def column(*names: str) -> list[float] | None:
+        """读取首个存在的 CSV 列并转为浮点列表；所有别名缺失时返回 ``None``。"""
+
         for name in names:
             if name in columns:
                 return [float(row[name]) for row in rows]
@@ -213,6 +301,8 @@ def _read_csv(path: Path) -> Mapping[str, Any]:
 
 
 def _numbered_columns(columns: list[str], prefixes: tuple[str, ...], count: int) -> list[str] | None:
+    """寻找从 0 连续编号的整组列名；任一编号缺失时尝试下一个前缀。"""
+
     for prefix in prefixes:
         candidates = []
         for index in range(count):
@@ -227,7 +317,21 @@ def _numbered_columns(columns: list[str], prefixes: tuple[str, ...], count: int)
 
 
 def _reference_from_mapping(payload: Mapping[str, Any], target_dt_s: float) -> SensorReference:
+    """把别名兼容的字段映射规范为严格的 :class:`SensorReference`。
+
+    时间缺失时按 ``target_dt_s`` 生成；关节零位先减、方向符号后乘。接触值绝对值
+    大于 1 时视为力值并按 5 N 归一化，再统一裁剪到 ``[0,1]``。
+
+    Returns:
+        尚未重采样、但字段 shape、有限值和时间单调性均已验证的参考对象。
+
+    Raises:
+        SensorReferenceFormatError: 必需字段缺失，任一字段 shape/标定/时间契约不合法。
+    """
+
     def get(*names: str) -> Any:
+        """从输入映射读取首个字段别名；全部缺失时返回 ``None``。"""
+
         for name in names:
             if name in payload:
                 return payload[name]
@@ -273,8 +377,8 @@ def _reference_from_mapping(payload: Mapping[str, Any], target_dt_s: float) -> S
     contact = _optional_tensor(get("contact_lr", "contact", "foot_contact"), length, (2,))
     gait = _optional_tensor(get("gait_id", "gait"), length, ())
     if contact is not None:
-        # Both binary contact and force-like recordings are accepted.  Values
-        # above one are interpreted as newtons and normalized by 5 N.
+        # 二值接触和类似力的记录都可接受；绝对值大于 1 时按 N 理解，
+        # 再用 5 N 归一化到 [0, 1]。
         contact = torch.where(contact.abs() > 1.0, contact.abs() / 5.0, contact).clamp(0.0, 1.0)
     if gait is not None:
         gait = gait.round().to(dtype=torch.long).reshape(length)
@@ -282,6 +386,8 @@ def _reference_from_mapping(payload: Mapping[str, Any], target_dt_s: float) -> S
 
 
 def _tensor(value: Any, name: str) -> torch.Tensor:
+    """把必需数值字段转为 CPU ``float32`` 张量，缺失或非数值时抛出格式错误。"""
+
     if value is None:
         raise SensorReferenceFormatError(f"reference is missing required field '{name}'")
     try:
@@ -292,12 +398,14 @@ def _tensor(value: Any, name: str) -> torch.Tensor:
 
 
 def _optional_tensor(value: Any, length: int, trailing_shape: tuple[int, ...]) -> torch.Tensor | None:
+    """校验可选时间序列字段，并兼容铺平的 ``[T,18]`` 陀螺仪。"""
+
     if value is None:
         return None
     tensor = _tensor(value, "optional")
     expected = (length, *trailing_shape)
     if tensor.shape != expected:
-        # Permit flattened [T, 18] gyro input.
+        # 同时接受已展平的 [T, 18] 陀螺仪输入。
         if trailing_shape == (6, 3) and tensor.shape == (length, 18):
             tensor = tensor.reshape(length, 6, 3)
         else:
@@ -308,7 +416,16 @@ def _optional_tensor(value: Any, length: int, trailing_shape: tuple[int, ...]) -
 
 
 def _resample_reference(reference: SensorReference, target_dt_s: float) -> SensorReference:
-    """Linearly resample continuous channels and nearest-neighbor labels."""
+    """连续通道线性重采样，离散 gait 标签最近邻重采样。
+
+    Args:
+        reference: 时间严格递增的源轨迹。
+        target_dt_s: 目标样本间隔 [s]。
+
+    Returns:
+        从 0 秒开始的新轨迹；位置、速度、陀螺仪和接触连续插值，接触再次裁剪到
+        ``[0,1]``，gait 保持整数标签。
+    """
 
     old_t = reference.t_s
     duration = float(old_t[-1])
@@ -317,12 +434,16 @@ def _resample_reference(reference: SensorReference, target_dt_s: float) -> Senso
     new_t[-1] = min(float(new_t[-1]), duration)
 
     def interpolate(values: torch.Tensor) -> torch.Tensor:
+        """把连续张量沿时间维线性插值到 ``new_t``，其余维度保持不变。"""
+
         right = torch.searchsorted(old_t, new_t).clamp(1, old_t.numel() - 1)
         left = right - 1
         alpha = ((new_t - old_t[left]) / (old_t[right] - old_t[left])).reshape(-1, *([1] * (values.ndim - 1)))
         return values[left] * (1.0 - alpha) + values[right] * alpha
 
     def nearest(values: torch.Tensor) -> torch.Tensor:
+        """按最近时间点采样离散标签，距离相等时选择左侧旧样本。"""
+
         right = torch.searchsorted(old_t, new_t).clamp(1, old_t.numel() - 1)
         left = right - 1
         choose_right = (new_t - old_t[left]) > (old_t[right] - new_t)
@@ -339,15 +460,20 @@ def _resample_reference(reference: SensorReference, target_dt_s: float) -> Senso
 
 
 def _to_device(reference: SensorReference, device: torch.device) -> SensorReference:
+    """把存在的所有参考张量移动到同一设备，保持缺失字段为 ``None``。"""
+
     return SensorReference(
-        *(value.to(device=device) if value is not None else None for value in (
-            reference.t_s,
-            reference.joint_pos_rad,
-            reference.joint_vel_rad_s,
-            reference.gyro_rad_s,
-            reference.contact_lr,
-            reference.gait_id,
-        ))
+        *(
+            value.to(device=device) if value is not None else None
+            for value in (
+                reference.t_s,
+                reference.joint_pos_rad,
+                reference.joint_vel_rad_s,
+                reference.gyro_rad_s,
+                reference.contact_lr,
+                reference.gait_id,
+            )
+        )
     )
 
 

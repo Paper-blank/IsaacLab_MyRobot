@@ -1,3 +1,5 @@
+# 本文件只做“采集坐标 -> Isaac Lab 关节/传感器坐标”的转换。
+# 修改符号或矩阵前必须做单关节、单传感器标定；不要用奖励结果反推正负号。
 version: 2
 description: Direction calibration from the recorded exoskeleton channels to the Isaac Lab articulation frame.
 coordinate_calibration:

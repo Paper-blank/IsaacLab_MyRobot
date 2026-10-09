@@ -1,8 +1,14 @@
 version: 1
 description: Multimodal imitation reward contract for Isaac-MyExoskeleton-Imitation-v0.
-# Similarities are positive exp(-MSE / sigma^2) scores.  Missing channels are
-# removed from the denominator instead of being treated as a perfect match.
+# 这是一份便于人阅读和工具检查的“模仿奖励契约”，当前训练代码不会自动加载它来覆盖
+# Python 环境配置。真正生效的 RewardTerm 和 weight 位于
+# envs/my_exoskeleton_imitation_env_cfg.py::MyExoskeletonImitationRewardsCfg。
+#
+# 每项相似度都是正分数 exp(-MSE / sigma^2)：完全一致时接近 1，误差越大越接近 0。
+# sigma 是容忍尺度，数值越大，对相同误差扣分越慢。某种传感器缺失或被禁用时，该
+# 通道会被有效性掩码排除，而不是把全零数据误判成完美匹配。
 weights:
+  # 下列数值表达各模态的相对重要程度；最终训练还会与基础运动/安全奖励一起汇总。
   imu: 1.0
   gyro: 0.5
   joint: 0.5
@@ -10,6 +16,7 @@ weights:
   rgb: 0.25
   event: 0.25
 sigmas:
+  # 每个 sigma 使用对应物理量的单位；RGB/事件已变成无量纲紧凑特征。
   imu_orientation_rad: 0.35
   gyro_rad_s: 1.0
   accelerometer_m_s2: 2.0
@@ -18,12 +25,14 @@ sigmas:
   rgb_feature: 0.25
   event_feature: 1.0
 channels:
+  # 一个 IMU 有 9 个数：欧拉角3、角速度3、线加速度3。6 个 IMU 展平后共54维。
   imu_count: 6
   imu_features: [roll_rad, pitch_rad, yaw_rad, gyro_x_rad_s, gyro_y_rad_s, gyro_z_rad_s, acc_x_m_s2, acc_y_m_s2, acc_z_m_s2]
   rgb_feature_layout: [left_mean_rgb, right_mean_rgb, left_std_rgb, right_std_rgb]
-  # Four camera/polarity planes; each PPO frame is pooled to 2x4 spatial bins.
+  # 事件特征有 2 台相机 * 2 个极性平面；每个平面池化成 2x4=8 个空间格，合计32维。
   event_histogram_layout: [left_positive, left_negative, right_positive, right_negative]
 validity:
+  # mask 表示对应数据不存在时该项奖励为0，并从组合奖励分母中移除。
   missing_motion: mask_joint_reward
   missing_rgb: mask_rgb_reward
   missing_event: mask_event_reward

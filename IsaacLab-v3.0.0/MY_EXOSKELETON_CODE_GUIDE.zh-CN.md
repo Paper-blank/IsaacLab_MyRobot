@@ -168,18 +168,19 @@ uv run --extra isaacsim --extra rl-games \
 ```mermaid
 flowchart TD
     A[终端命令] --> B[train_my_exoskeleton.py]
-    B --> C[整理自定义参数]
+    B --> C[准备 USD 运行库和 Python 导入路径]
     C --> D[导入 my_exoskeleton.py 注册 Gym 任务]
-    D --> E[Isaac Lab run_train_cli]
-    E --> F[读取环境 Cfg 与 PPO YAML]
-    F --> G[创建 URDF 机器人、地面和传感器]
-    G --> H[创建多个并行环境]
-    H --> I[RL-Games PPO 循环]
-    I --> J[采集观测]
-    J --> K[策略网络输出 8 维动作]
-    K --> L[仿真前进一步]
-    L --> M[计算奖励和终止条件]
-    M --> I
+    D --> E[校验并翻译外骨骼自定义参数]
+    E --> F[Isaac Lab run_train_cli]
+    F --> G[读取环境 Cfg 与 PPO YAML]
+    G --> H[创建 URDF 机器人、地面和传感器]
+    H --> I[创建多个并行环境]
+    I --> J[RL-Games PPO 循环]
+    J --> K[采集观测]
+    K --> L[策略网络输出 8 维动作]
+    L --> M[仿真前进一步]
+    M --> N[计算奖励和终止条件]
+    N --> J
 ```
 
 每个文件的职责：
@@ -190,11 +191,13 @@ flowchart TD
 4. `my_exoskeleton_flat.py` 和 `my_exoskeleton_imitation.py` 提供运行时计算逻辑。
 5. `my_exoskeleton*_ppo.yaml` 决定神经网络和 PPO 如何学习。
 
-### 3.1 为什么启动脚本先处理参数再导入 Isaac Lab
+### 3.1 为什么启动脚本必须遵守固定顺序
 
 Isaac Sim 有严格的启动顺序，一些模块只能在 Kit 运行时建立后导入。启动脚本中的
 `_bootstrap_isaacsim_usd()`、路径注入和延迟 `import` 不是多余代码，不要为了“整理”
-而移动到文件顶部。顺序错误可能导致 USD 动态库无法加载或仿真器启动失败。
+而移动到文件顶部。当前实际顺序是：先准备 USD 运行库与导入路径，再导入
+训练入口和任务注册模块，然后才解析项目自定义参数。顺序错误可能导致 USD 动态库无法
+加载、Gym 找不到任务，或仿真器启动失败。
 
 ### 3.2 `--参数` 到底是什么
 
@@ -273,15 +276,18 @@ checkpoint 时，网络和优化器能恢复，但环境课程计数需要用 `s
 | PPO 配置 | `my_exoskeleton_ppo.yaml` | `my_exoskeleton_imitation_ppo.yaml` |
 | 数据集 | 可选单轨迹参考 | 多任务、多模态序列 |
 
-模仿任务继承普通任务，而不是复制整套代码。也就是说，普通行走奖励、步态状态机和
-安全终止仍然存在，模仿任务在此基础上增加数据集采样、IMU/RGB/Event 目标和模仿奖励。
+模仿**配置** `MyExoskeletonImitationEnvCfg` 继承普通配置，因此能复用场景、动作、奖励和
+终止配置。但运行时的 `MyExoskeletonImitationEnv` 直接继承 Isaac Lab 的
+`ManagerBasedRLEnv`，并调用普通任务模块中的观测、奖励和步态函数；它不继承
+`MyExoskeletonFlatEnv` 运行时类。在这些复用部分之上，模仿环境再增加数据集采样、
+IMU/RGB/Event 目标和模仿奖励。
 
 ## 6. 模仿数据从文件到奖励的路径
 
 ```mermaid
 flowchart TD
     A[数据集目录] --> B[imitation_dataset.py]
-    B --> C[校验任务ID、时间戳、shape和单位]
+    B --> C[解析、排序去重并校验字段与shape]
     C --> D[按环境抽取任务与序列]
     D --> E[my_exoskeleton_imitation.py 写入当前目标缓存]
     E --> F[imitation_reward.py 读取目标与仿真传感器]
@@ -302,24 +308,29 @@ NaN。项目用 valid mask 把缺失通道从分子和分母中一起移除，�
 
 ### 6.3 时间戳和插值
 
-数据采集频率不一定正好等于 50 Hz。加载器先验证时间戳严格递增，再根据目标控制周期
-采样或插值。速度、角加速度必须使用真实时间差，不能假设每两个文件记录永远相隔
-`0.02 s`。
+数据采集频率不一定正好等于 50 Hz。多模态加载器会先解析时间戳，按时间稳定排序并
+去除重复采样，再统一时间起点、根据目标控制周期重采样或插值。因此原始文件偶然乱序并不是
+立即拒绝；处理后的时间轴才必须无重复且严格递增。速度、角加速度的生成或校验必须使用
+真实时间差，不能假设每两个文件记录永远相隔 `0.02 s`。
 
 ## 7. 结果输出和未来序列
 
-`ruleresult.py` 位于策略回放之后。它不会改变 actor 的 8 维动作，而是读取环境实际的
-关节状态，生成包含角度、速度、角加速度、时间信息和可选预测序列的结构化结果。
+`ruleresult.py` 位于策略回放之后。它不会改变 actor 的 8 维动作。记录顶层的
+`angle_rad`、`velocity_rad_s` 和 `angular_acceleration_rad_s2` 来自动作管理器的
+处理后目标角及其按时间差计算的导数，合计 24 个物理量。仿真关节的实际位置、速度和
+加速度只放在同一条记录的 `measured` 字段中，两者不能混用。
 
 ```mermaid
 flowchart LR
     A[play脚本] --> B[策略与环境step]
     B --> C[RuleresultRecorderMixin]
-    C --> D[关节顺序标准化]
-    D --> E[按真实或固定dt计算导数]
+    C --> D[取处理后的目标角]
+    D --> E[标准化关节顺序并按dt计算目标导数]
     E --> F{输出格式}
     F --> G[JSONL可读记录]
     F --> H[55AA二进制帧]
+    C --> I[读取仿真实际关节状态]
+    I --> J[写入 measured 字段]
 ```
 
 重要区别：
@@ -347,8 +358,10 @@ flowchart TD
 
 ### 8.1 `trajectory.py`
 
-负责把不同 JSON/JSONL 外形转换为统一的 `Trajectory`。它检查时间戳、关节数量、有限
-数值和导数，并支持线性、三次 Hermite 或五次插值。它不负责电机编号。
+负责把不同 JSON/JSONL 外形转换为统一的 `Trajectory`。它检查必需字段、时间戳、关节
+顺序与数量、shape 和数值是否有限，并支持线性、三次 Hermite 或五次插值。它不会额外
+验证文件中的速度是否等于角度导数，也不会验证加速度是否等于速度导数；这类运动学
+一致性必须在实体上机前另行检查。本模块也不负责电机编号。
 
 ### 8.2 `joint_mapping.py`
 
@@ -357,9 +370,11 @@ flowchart TD
 
 ### 8.3 `safety.py`
 
-采用 fail-closed（失败即停止）原则。任何 NaN、越界、跳变过快、反馈超时或跟踪误差
-都应拒绝继续发送。协议能够表示的范围通常远大于人体和机械真正安全的范围，二者不能
-混为一谈。
+`SafetyLimiter` 提供 fail-closed（失败即停止）的状态机和检查框架：NaN 等非有限数会
+无条件拒绝；位置、速度、加速度、jerk 和跟踪误差只有在对应限值已配置时才会检查；
+缺少反馈只有在 `require_feedback=True` 时才会终止。默认 `SafetyConfig` 没有逐关节限位、
+也不强制反馈，只适合 dry-run（空运行），不能直接用于人体穿戴。协议可表示范围通常远大于
+人体和机械的真正安全范围，上机前必须用实测并经审批的限值与反馈策略替换默认值。
 
 ### 8.4 `replay.py`
 
@@ -450,6 +465,9 @@ URDF（Unified Robot Description Format）描述连杆和关节：
 
 修改关节名会影响环境传感器路径、动作顺序、奖励、数据集映射和通讯映射，不能只改
 URDF 一处。网格看起来正确也不代表碰撞体、惯量和关节轴正确，必须单环境可视化验证。
+
+逐标签、当前关节树、左右膝符号、传感器和联动修改清单见
+[URDF 零基础详解](source/isaaclab_assets/data/my_robot/urdf/README.zh-CN.md)。
 
 ## 11. 模块逐个看：应该先读什么
 

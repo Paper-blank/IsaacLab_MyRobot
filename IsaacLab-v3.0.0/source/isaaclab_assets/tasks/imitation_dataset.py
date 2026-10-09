@@ -3,25 +3,26 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Dataset and mapping utilities for vision/IMU motion imitation.
+"""外骨骼视觉、IMU 与关节运动模仿的数据读取层。
 
-The recorder used by this project stores one trial below::
+本项目的记录器把一次试验（trial）保存为下面的目录结构::
 
     records/<subject>/<date>/<task-id>/TrialXX/
 
-Each trial normally contains ``*_imu_01.csv`` ... ``*_imu_11.csv``, two RGB
-videos and two DVXplorer ``.aedat4`` recordings.  The loader deliberately
-keeps media decoding optional: IMU data is parsed eagerly and video/event
-streams are decoded only when a sampled window asks for them.  In particular,
-an event preview video is never treated as an event stream.
+每个 trial 通常包含 ``*_imu_01.csv`` 到 ``*_imu_11.csv``、左右两路 RGB 视频和
+两路 DVXplorer ``.aedat4``。训练只使用 01--06 六个腿部 IMU。创建数据集时会立即
+读取体积较小的 IMU、压力和可选关节轨迹，并统一到 ``target_dt_s`` 时间轴；视频帧
+与事件流体积大，只在某个采样窗口真正需要时延迟解码和缓存。事件预览 MP4 绝不会
+冒充异步事件数据。
 
-The module has no Isaac Sim imports and can therefore be used by data
-preparation scripts and unit tests without starting Kit.
+输出是适合 PyTorch/DataLoader 和仿真环境使用的字典。每个可选模态同时带 ``valid``
+掩码：零张量只用于保持批处理 shape 稳定，``False`` 才表示文件缺失、损坏或解码器
+不可用。模块不导入 Isaac Sim，因此数据预处理和单元测试无需启动 Kit。
 
-Recorded direction conventions are normalized at load time.  The default
-``sensor_coordinate_mapping.yaml`` flips the four sagittal hip/knee channels
-and maps the IMU axes into the articulation frame; pass ``calibration_path``
-to :class:`ExoskeletonImitationDataset` for a site-specific sign map.
+读取顺序为：加载任务/坐标 YAML -> 发现 trial -> 解析并校准非媒体通道 -> 按需抽取
+时间窗口 -> 延迟读取 RGB/Event。默认 ``sensor_coordinate_mapping.yaml`` 会把四个
+矢状面髋/膝通道及左右 IMU 坐标映射到仿真关节约定；实体安装方向不同的场地应通过
+``calibration_path`` 提供实测标定，不能靠修改奖励掩盖方向错误。
 """
 
 from __future__ import annotations
@@ -67,30 +68,23 @@ IMU_IDS = tuple(f"imu_{index:02d}" for index in range(1, 7))
 
 
 class DatasetFormatError(ValueError):
-    """Raised when a recording cannot be interpreted safely."""
+    """表示记录文件不满足可安全解释的数据契约。"""
 
 
-# The recorder and the URDF use the same right-leg-then-left-leg order.  The
-# hip/knee axes are mirrored across the sagittal plane, so the data-to-
-# articulation signs are side-specific: right hip ``+``, right knee ``-``,
-# left hip ``-``, left knee ``+``.  Turn and ankle signs remain configurable
-# because their encoder conventions cannot be inferred from the joint axis
-# alone.  A site-specific YAML can override this tuple after a single-joint
-# calibration trial.
+# 记录仪与 URDF 都采用右腿在前、左腿在后的顺序。髋/膝轴关于矢状面镜像，因此数据到
+# articulation 的符号需要区分左右侧：右髋 ``+``、右膝 ``-``、左髋 ``-``、左膝
+# ``+``。转向与踝关节的编码器约定无法只根据关节轴推断，所以仍允许配置；完成单关节
+# 标定试验后，可用现场专属 YAML 覆盖此元组。
 DEFAULT_JOINT_SIGN = (1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0)
-# Legacy fallback signs for callers that do not identify a recorder sensor.
-# The six-channel dataset path uses the explicit left/right matrices below and
-# therefore does not apply these vectors a second time.
+# 这些是未指定记录仪传感器的旧调用方所用兼容符号。六通道数据集路径使用下方显式
+# 左/右矩阵，因此不会再次应用这些向量。
 DEFAULT_IMU_ACCEL_SIGN = (-1.0, -1.0, 1.0)
 DEFAULT_IMU_GYRO_SIGN = (-1.0, -1.0, 1.0)
 DEFAULT_IMU_ORIENTATION_SIGN = (1.0, -1.0, 1.0)
-# The recorder's retained channels alternate between legs: IMU-01/03/05 are
-# mounted on the left leg and IMU-02/04/06 on the right leg.  Within each
-# side, 01/02 are ankles, 03/04 are knees, and 05/06 are hips.  IMU-07..11
-# are intentionally ignored by the imitation loader.  A matrix row is one
-# simulation axis expressed in dataset coordinates.  For example, the
-# right-leg matrix maps ``(dataset_x, dataset_y, dataset_z)`` to
-# ``(joint_y, joint_x, -joint_z)``.
+# 记录仪保留的通道按左右腿交错：IMU-01/03/05 安装在左腿，IMU-02/04/06 安装在右腿；
+# 其中 01/02 是踝部、03/04 是膝部、05/06 是髋部。模仿加载器有意忽略 IMU-07..11。
+# 矩阵每一行表示一个仿真轴在数据集坐标中的表达；例如右腿矩阵把
+# ``(dataset_x, dataset_y, dataset_z)`` 映射为 ``(joint_y, joint_x, -joint_z)``。
 DEFAULT_IMU_SENSOR_SIDES = ("left", "right", "left", "right", "left", "right")
 DEFAULT_IMU_AXIS_TRANSFORMS = {
     "right": (
@@ -110,24 +104,21 @@ _IDENTITY_ROTATION = (
     (0.0, 1.0, 0.0),
     (0.0, 0.0, 1.0),
 )
-DEFAULT_IMU_JOINT_LINK_ROTATIONS = {
-    f"imu_{index:02d}": _IDENTITY_ROTATION for index in range(1, 7)
-}
-DEFAULT_IMU_LINK_SENSOR_ROTATIONS = {
-    f"imu_{index:02d}": _IDENTITY_ROTATION for index in range(1, 7)
-}
+DEFAULT_IMU_JOINT_LINK_ROTATIONS = {f"imu_{index:02d}": _IDENTITY_ROTATION for index in range(1, 7)}
+DEFAULT_IMU_LINK_SENSOR_ROTATIONS = {f"imu_{index:02d}": _IDENTITY_ROTATION for index in range(1, 7)}
 
 
 @dataclass(frozen=True)
 class SensorCoordinateCalibration:
-    """Map recorded channels into the simulation convention.
+    """把记录仪坐标和关节方向转换到仿真约定。
 
-    Leg sensors use the explicit signed-permutation matrices above, which
-    handle the mirrored left/right mounting frames without changing the
-    observation shape or the PPO contract.  The legacy base signs remain
-    available for callers that explicitly select a ``base`` sensor side (or
-    omit ``sensor_index``), but no retained dataset channel uses that side by
-    default.
+    左右腿使用显式的带符号置换矩阵处理镜像安装，转换只改变数值方向，不改变数组
+    shape 或 PPO 输入维度。旧版全局符号仍供未提供 ``sensor_index`` 的外部调用者
+    使用；本数据集保留的六路腿部 IMU 默认都走逐传感器矩阵。
+
+    所有 IMU 输入最后一维必须是 3。关节输入最后一维必须是 8，顺序采用
+    ``robot_contract.ACTUATED_JOINT_NAMES``。角度使用 rad、角速度使用 rad/s、线加速度
+    使用 m/s^2。
     """
 
     joint_sign: tuple[float, ...] = DEFAULT_JOINT_SIGN
@@ -138,10 +129,8 @@ class SensorCoordinateCalibration:
     imu_axis_transforms: Mapping[str, tuple[tuple[float, ...], ...]] | None = field(
         default_factory=lambda: dict(DEFAULT_IMU_AXIS_TRANSFORMS)
     )
-    # Physical mounting rotations are intentionally separate from the legacy
-    # signed axis map.  The latter contains the project's left/right data
-    # convention (the left matrix is a reflection), while these two matrices
-    # are real frame rotations and must remain right-handed.
+    # 物理安装旋转刻意与旧版带符号轴映射分开：后者包含项目的左右数据约定（左侧矩阵
+    # 是反射），而下面两个矩阵表示真实坐标系旋转，必须保持右手系。
     imu_joint_link_rotations: Mapping[str, tuple[tuple[float, ...], ...]] = field(
         default_factory=lambda: dict(DEFAULT_IMU_JOINT_LINK_ROTATIONS)
     )
@@ -151,20 +140,41 @@ class SensorCoordinateCalibration:
     imu_orientation_mode: str = "euler_components"
 
     def _sensor_side(self, sensor_index: int | None, sensor_side: str | None) -> str | None:
-        """Resolve a recorder index (01/02 ankle, 03/04 knee, 05/06 hip) to a side."""
+        """把记录仪编号解析为 ``left``、``right`` 或 ``base``。
+
+        Args:
+            sensor_index: 一基编号；01/02 是踝、03/04 是膝、05/06 是髋。
+            sensor_side: 调用者显式给出的侧别；提供后优先于编号。
+
+        Returns:
+            规范化侧别；两项均未提供时返回 ``None``。
+
+        Raises:
+            ValueError: 编号不在已配置六路传感器范围内。
+            DatasetFormatError: 侧别文本无法识别。
+        """
 
         if sensor_side is not None:
             return _normalise_sensor_side(sensor_side)
         if sensor_index is None:
             return None
         if sensor_index < 1 or sensor_index > len(self.imu_sensor_sides):
-            raise ValueError(
-                f"sensor_index must be in [1, {len(self.imu_sensor_sides)}], got {sensor_index}"
-            )
+            raise ValueError(f"sensor_index must be in [1, {len(self.imu_sensor_sides)}], got {sensor_index}")
         return self.imu_sensor_sides[sensor_index - 1]
 
     def _apply_axis_transform(self, values: np.ndarray, sensor_side: str | None) -> np.ndarray | None:
-        """Apply a configured leg matrix, or return ``None`` for legacy signs."""
+        """应用某侧的 3x3 轴映射；需要旧版全局符号时返回 ``None``。
+
+        Args:
+            values: shape 为 ``[..., 3]`` 的方向、角速度或加速度数组。
+            sensor_side: 规范化后的 ``left``、``right``、``base`` 或 ``None``。
+
+        Returns:
+            shape 和 dtype 与输入一致的转换结果；没有逐侧矩阵时返回 ``None``。
+
+        Raises:
+            ValueError: 输入最后一维不是 3。
+        """
 
         if sensor_side in (None, "base") or self.imu_axis_transforms is None:
             return None
@@ -177,6 +187,8 @@ class SensorCoordinateCalibration:
         return np.einsum("ij,...j->...i", np.asarray(matrix, dtype=array.dtype), array)
 
     def _sensor_key(self, sensor_index: int | None, sensor_side: str | None) -> str | None:
+        """返回安装旋转表使用的 IMU 键；无法确定具体传感器时返回 ``None``。"""
+
         if sensor_index is not None:
             return f"imu_{sensor_index:02d}"
         if sensor_side in ("left", "right"):
@@ -189,14 +201,15 @@ class SensorCoordinateCalibration:
         sensor_index: int | None = None,
         sensor_side: str | None = None,
     ) -> np.ndarray | None:
-        """Return ``R_joint_link @ R_link_sensor @ R_sensor_IMU``.
+        """组合并返回 ``R_joint_link @ R_link_sensor @ R_sensor_IMU``。
 
-        ``R_sensor_IMU`` is the existing recorder-to-leg signed axis map.  It
-        is kept as a general orthogonal map because the prescribed left-leg
-        convention has determinant ``-1``; it is therefore suitable for
-        vector/channel remapping but is not itself a physical quaternion
-        rotation.  The two mounting matrices are physical rotations and are
-        identity until measured from the USD/fixture or a calibration trial.
+        ``R_sensor_IMU`` 是记录坐标到腿部坐标的正交轴映射；左腿约定的行列式为
+        ``-1``，所以它适合重排向量通道，却不能单独当作物理四元数旋转。另外两个
+        矩阵是右手系物理安装旋转，未从 USD/夹具或标定试验测量前默认为单位矩阵。
+
+        Returns:
+            shape ``[3, 3]`` 的 ``float64`` NumPy 数组；旧版 ``base``/无侧别模式返回
+            ``None``。
         """
 
         side = self._sensor_side(sensor_index, sensor_side)
@@ -216,7 +229,7 @@ class SensorCoordinateCalibration:
 
     @staticmethod
     def _euler_xyz_to_matrix(values: np.ndarray) -> np.ndarray:
-        """Convert ``[roll, pitch, yaw]`` to an XYZ rotation matrix."""
+        """把 ``[...,3]`` 的 ``[roll,pitch,yaw]`` [rad] 转成 XYZ 旋转矩阵。"""
 
         roll, pitch, yaw = np.moveaxis(np.asarray(values, dtype=np.float64), -1, 0)
         sr, cr = np.sin(roll), np.cos(roll)
@@ -236,7 +249,7 @@ class SensorCoordinateCalibration:
 
     @staticmethod
     def _matrix_to_euler_xyz(matrix: np.ndarray) -> np.ndarray:
-        """Convert XYZ rotation matrices to ``[roll, pitch, yaw]``."""
+        """把 XYZ 旋转矩阵转回 ``[...,3]`` 的 ``[roll,pitch,yaw]`` [rad]。"""
 
         matrix = np.asarray(matrix, dtype=np.float64)
         pitch = np.arcsin(np.clip(-matrix[..., 2, 0], -1.0, 1.0))
@@ -245,18 +258,18 @@ class SensorCoordinateCalibration:
         yaw = np.arctan2(matrix[..., 1, 0], matrix[..., 0, 0])
         singular = np.abs(cp) < 1.0e-7
         if np.any(singular):
-            # A deterministic gimbal-lock convention: preserve yaw=0 and
-            # place the residual rotation in roll.
+            # 使用确定性的万向节锁约定：保持 yaw=0，把剩余旋转归入 roll。
             roll = np.where(singular, np.arctan2(-matrix[..., 0, 1], matrix[..., 1, 1]), roll)
             yaw = np.where(singular, 0.0, yaw)
         return np.stack((roll, pitch, yaw), axis=-1)
 
     def _transform_orientation(self, orientation: np.ndarray, transform: np.ndarray) -> np.ndarray:
+        """按配置模式变换 ``[...,3]`` 欧拉角 [rad]，并保持输入 dtype。"""
+
         values = np.asarray(orientation)
         if self.imu_orientation_mode == "euler_components":
-            # Compatibility mode for the recorder's published Euler channels.
-            # This is the established component convention, not quaternion
-            # multiplication; use rotation_matrix after mounting calibration.
+            # 这是记录仪已发布欧拉角通道的兼容模式，采用既定的分量约定而非四元数相乘；
+            # 完成安装标定后应使用 rotation_matrix。
             return np.einsum("ij,...j->...i", transform.astype(values.dtype), values)
         if not np.isclose(np.linalg.det(transform), 1.0, atol=1.0e-5):
             raise DatasetFormatError(
@@ -274,13 +287,25 @@ class SensorCoordinateCalibration:
         sensor_index: int | None = None,
         sensor_side: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return calibrated ``(orientation, gyro, accel)`` arrays.
+        """返回完成坐标标定的 ``(orientation, gyro, accel)`` 数组。
 
-        ``sensor_index`` is one-based and matches the recorder filename
-        suffix (``imu_01`` through ``imu_06``).  For a retained leg sensor, the
-        same coordinate transform is applied to all three vectors, exactly
-        matching the requested dataset-to-joint mapping.  Omitting the index
-        preserves the pre-existing global-sign behavior for external callers.
+        ``sensor_index`` 与文件名 ``imu_01``--``imu_06`` 的一基后缀一致。对腿部 IMU，
+        姿态分量、陀螺仪和加速度使用同一坐标变换；省略编号会保留外部旧调用者所需的
+        全局符号行为。
+
+        Args:
+            orientation: shape ``[..., 3]`` 的 roll/pitch/yaw [rad]。
+            gyro: shape ``[..., 3]`` 的角速度 [rad/s]。
+            accel: shape ``[..., 3]`` 的线加速度 [m/s^2]。
+            sensor_index: 可选一基记录仪编号。
+            sensor_side: 可选侧别，显式提供时优先。
+
+        Returns:
+            三个 shape 与各自输入相同的 NumPy 数组。
+
+        Raises:
+            DatasetFormatError: 旋转矩阵模式收到非右手系有效变换。
+            ValueError: 传感器编号或输入 shape 不合法。
         """
 
         side = self._sensor_side(sensor_index, sensor_side)
@@ -302,7 +327,17 @@ class SensorCoordinateCalibration:
         )
 
     def apply_motion(self, motion: np.ndarray) -> np.ndarray:
-        """Apply joint signs to an array whose final dimension has eight joints."""
+        """把八关节记录值的正负方向转换为 canonical 仿真方向。
+
+        Args:
+            motion: shape ``[..., 8]`` 的关节角 [rad] 或关节速度 [rad/s]。
+
+        Returns:
+            与输入 shape 相同的 NumPy 数组。
+
+        Raises:
+            ValueError: 最后一维不是八个关节。
+        """
 
         values = np.asarray(motion)
         if values.ndim == 0 or values.shape[-1] != 8:
@@ -311,7 +346,7 @@ class SensorCoordinateCalibration:
 
 
 def _validated_signs(value: Any, size: int, name: str, default: Sequence[float]) -> tuple[float, ...]:
-    """Validate a sign vector while keeping a safe default for omitted YAML fields."""
+    """校验只含 ``+1/-1`` 的符号向量；YAML 省略字段时使用安全默认值。"""
 
     if value is None:
         value = default
@@ -325,7 +360,7 @@ def _validated_signs(value: Any, size: int, name: str, default: Sequence[float])
 
 
 def _normalise_sensor_side(value: Any) -> str:
-    """Normalize the side labels accepted by the YAML and public API."""
+    """把 YAML/公开 API 接受的侧别别名统一为 base、left 或 right。"""
 
     side = str(value).strip().lower()
     aliases = {
@@ -346,7 +381,7 @@ def _normalise_sensor_side(value: Any) -> str:
 
 
 def _validated_sensor_sides(value: Any, default: Sequence[str] = DEFAULT_IMU_SENSOR_SIDES) -> tuple[str, ...]:
-    """Validate the six-sensor side assignment from a calibration file."""
+    """校验标定文件中的六路传感器侧别分配。"""
 
     if value is None:
         value = default
@@ -363,11 +398,10 @@ def _validated_axis_transforms(
     value: Any,
     default: Mapping[str, tuple[tuple[float, ...], ...]] = DEFAULT_IMU_AXIS_TRANSFORMS,
 ) -> dict[str, tuple[tuple[float, ...], ...]]:
-    """Validate 3x3 signed-permutation matrices keyed by leg side.
+    """校验按左右腿索引的 3x3 带符号置换矩阵。
 
-    Matrices use the convention ``output = matrix @ dataset_vector``.  Each
-    row and column must contain exactly one ``+1`` or ``-1`` so an accidental
-    scale/shear cannot silently corrupt the sensor target.
+    约定为 ``output = matrix @ dataset_vector``。每行每列必须恰有一个 ``+1/-1``，
+    从而拒绝会悄悄缩放或剪切传感器目标的错误矩阵。
     """
 
     if value is None:
@@ -393,16 +427,10 @@ def _validated_axis_transforms(
             np.abs(matrix), 1.0, atol=1.0e-6
         )
         if not close_to_zero_or_one.all():
-            raise DatasetFormatError(
-                f"imu_axis_transforms[{side!r}] must contain only 0, +1, and -1 values"
-            )
+            raise DatasetFormatError(f"imu_axis_transforms[{side!r}] must contain only 0, +1, and -1 values")
         magnitudes = np.where(np.isclose(matrix, 0.0, atol=1.0e-6), 0.0, np.sign(matrix))
-        if not np.all(np.sum(np.abs(magnitudes), axis=0) == 1) or not np.all(
-            np.sum(np.abs(magnitudes), axis=1) == 1
-        ):
-            raise DatasetFormatError(
-                f"imu_axis_transforms[{side!r}] must be a signed permutation matrix"
-            )
+        if not np.all(np.sum(np.abs(magnitudes), axis=0) == 1) or not np.all(np.sum(np.abs(magnitudes), axis=1) == 1):
+            raise DatasetFormatError(f"imu_axis_transforms[{side!r}] must be a signed permutation matrix")
         validated[side] = tuple(tuple(float(item) for item in row) for row in magnitudes.tolist())
     return validated
 
@@ -412,12 +440,10 @@ def _validated_rotation_mapping(
     name: str,
     default: Mapping[str, tuple[tuple[float, ...], ...]],
 ) -> dict[str, tuple[tuple[float, ...], ...]]:
-    """Validate per-sensor right-handed 3-D mounting rotations.
+    """校验每路 IMU 的右手系三维物理安装旋转。
 
-    The source recordings do not contain a sensor-to-link mounting pose, so
-    the repository defaults are identity matrices.  Rejecting reflections
-    here is deliberate: a reflection belongs in the explicit left/right axis
-    convention, not in a quaternion rotation calibration.
+    源记录不含 sensor-to-link 安装姿态，所以默认单位矩阵。这里有意拒绝反射：镜像
+    应写入显式左右轴约定，不能混入可由四元数表示的物理旋转标定。
     """
 
     if value is None:
@@ -449,21 +475,26 @@ def _validated_rotation_mapping(
         if not np.allclose(matrix.T @ matrix, np.eye(3), atol=1.0e-5) or not np.isclose(
             np.linalg.det(matrix), 1.0, atol=1.0e-5
         ):
-            raise DatasetFormatError(
-                f"{name}[{sensor_id!r}] must be a right-handed orthonormal rotation (det=+1)"
-            )
+            raise DatasetFormatError(f"{name}[{sensor_id!r}] must be a right-handed orthonormal rotation (det=+1)")
         validated[sensor_id] = tuple(tuple(float(item) for item in row) for row in matrix.tolist())
     return validated
 
 
 def load_direction_calibration(path: str | Path | None = None) -> SensorCoordinateCalibration:
-    """Load data-to-simulation direction signs from YAML.
+    """从 YAML 加载记录坐标到仿真坐标的标定。
 
-    The root-level file is preferred so an experiment can be versioned beside
-    the dataset.  The package config is a fallback for installed/source-tree
-    use.  The implicit default falls back to calibrated constants; an explicit
-    missing path raises immediately so a typo cannot silently disable a site
-    calibration.
+    未给路径时优先使用仓库根目录文件，再回退到包内配置，最后回退到代码中的默认
+    常量。显式路径不存在则立即报错，避免拼写错误悄悄关闭场地标定。
+
+    Args:
+        path: 可选 ``sensor_coordinate_mapping.yaml`` 路径。
+
+    Returns:
+        经过数值、shape、正交性和左右侧别校验的标定对象。
+
+    Raises:
+        FileNotFoundError: 显式指定的文件不存在或不可读取。
+        DatasetFormatError: YAML 结构、符号、3x3 轴矩阵或安装旋转不合法。
     """
 
     explicit_path = path is not None
@@ -479,10 +510,8 @@ def load_direction_calibration(path: str | Path | None = None) -> SensorCoordina
     raw = payload.get("coordinate_calibration", payload)
     if not isinstance(raw, Mapping):
         raise DatasetFormatError("sensor coordinate mapping must contain a 'coordinate_calibration' mapping")
-    # ``imu_axis_transform`` was used by an early draft of the mapping file;
-    # accept it as a read-only compatibility alias while documenting the
-    # plural ``imu_axis_transforms`` spelling for new files.  A legacy file
-    # with no matrix section intentionally keeps the old global-sign behavior.
+    # 映射文件早期草案使用 ``imu_axis_transform``；这里把它作为只读兼容别名接受，新文件
+    # 则统一记录复数形式 ``imu_axis_transforms``。没有矩阵段的旧文件会保留原全局符号行为。
     axis_payload = raw.get("imu_axis_transforms", raw.get("imu_axis_transform"))
     axis_transforms = None if axis_payload is None else _validated_axis_transforms(axis_payload)
     joint_link_rotations = _validated_rotation_mapping(
@@ -513,14 +542,14 @@ def load_direction_calibration(path: str | Path | None = None) -> SensorCoordina
     )
 
 
-# Backwards-compatible descriptive alias for callers that used the first name
-# during development.  New code should use ``load_direction_calibration``.
+# 这是为开发期间使用旧名称的调用方保留的向后兼容别名；新代码应使用
+# ``load_direction_calibration`` 函数。
 load_sensor_coordinate_mapping = load_direction_calibration
 
 
 @dataclass(frozen=True)
 class TaskSpec:
-    """A task entry from :file:`task_mapping.yaml`."""
+    """``task_mapping.yaml`` 中一个 BT/AT 任务的编号、名称和类别。"""
 
     task_id: str
     name: str
@@ -529,7 +558,11 @@ class TaskSpec:
 
 @dataclass(frozen=True)
 class MotionSeries:
-    """Optional joint trajectory associated with a trial."""
+    """一个 trial 可选的八关节轨迹。
+
+    ``t_s`` 为 ``[T]`` 秒，``joint_pos_rad`` 为 ``[T, 8]`` rad，速度若存在则为
+    ``[T, 8]`` rad/s；三个数组已经使用 canonical 关节顺序和方向。
+    """
 
     t_s: np.ndarray
     joint_pos_rad: np.ndarray
@@ -538,7 +571,12 @@ class MotionSeries:
 
 @dataclass
 class TrialRecord:
-    """A discovered trial and its time-aligned non-media channels."""
+    """一个已发现 trial 的时间对齐数据与媒体文件索引。
+
+    IMU、接触和运动数组已在数据集构造阶段加载；``rgb_paths``/``event_paths`` 只保存
+    路径，等采样窗口时才解码。主要 shape：``t_s[T]``、``imu[T,6,9]``、三个 IMU
+    分量 ``[T,6,3]``、``imu_valid[6]``、``contact_lr[T,2]``。
+    """
 
     trial_id: str
     task_id: str
@@ -559,12 +597,14 @@ class TrialRecord:
 
     @property
     def length(self) -> int:
-        """Number of synchronized policy-rate samples."""
+        """返回同步后策略频率样本数 ``T``。"""
 
         return int(self.t_s.shape[0])
 
 
 def _yaml_load(path: Path) -> Mapping[str, Any]:
+    """读取 YAML 对象；文件不可读或顶层不是键值映射时给出明确错误。"""
+
     try:
         import yaml
     except ImportError as exc:  # pragma: no cover - normal Isaac Lab installs include PyYAML
@@ -580,6 +620,8 @@ def _yaml_load(path: Path) -> Mapping[str, Any]:
 
 
 def _yaml_dump(value: Mapping[str, Any], path: Path) -> None:
+    """把键值映射以 UTF-8 YAML 写入 ``path``，并自动创建父目录。"""
+
     try:
         import yaml
     except ImportError as exc:  # pragma: no cover
@@ -590,7 +632,7 @@ def _yaml_dump(value: Mapping[str, Any], path: Path) -> None:
 
 
 def load_task_mapping(path: str | Path | None = None) -> dict[str, TaskSpec]:
-    """Load and validate the ten task IDs used by the recorder."""
+    """加载并校验记录器使用的十个 BT/AT 任务编号。"""
 
     mapping_path = Path(path).expanduser() if path is not None else _DEFAULT_TASK_MAPPING
     if not mapping_path.is_file():
@@ -622,7 +664,7 @@ def load_task_mapping(path: str | Path | None = None) -> dict[str, TaskSpec]:
 
 
 def load_imu_mapping(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
-    """Load the six-sensor mapping without resolving it against a USD stage."""
+    """加载六路 IMU 到机器人 link 的声明映射，此时尚不访问 USD Stage。"""
 
     mapping_path = Path(path).expanduser() if path is not None else _DEFAULT_IMU_MAPPING
     if not mapping_path.is_file():
@@ -707,7 +749,7 @@ _LINK_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 def _normalise_link_name(name: str) -> str:
-    """Normalize a USD body path/name for alias matching."""
+    """去除路径、大小写和标点差异，生成用于别名匹配的 USD body 名。"""
 
     token = str(name).replace("\\", "/").split("/")[-1].lower()
     return re.sub(r"[^a-z0-9]", "", token)
@@ -718,12 +760,14 @@ def resolve_imu_mapping(
     mapping: Mapping[str, Mapping[str, Any]] | str | Path | None = None,
     output_path: str | Path | None = None,
 ) -> dict[str, str | None]:
-    """Resolve configured IMU links against names discovered in a USD articulation.
+    """把配置中的六路 IMU link 与 USD articulation 实际 body 名对应起来。
 
-    Matching uses exact normalized names followed by the aliases in the YAML.
-    Unresolved entries are returned as ``None``.  If ``output_path`` is given,
-    a YAML file containing the candidates and unresolved fields is emitted so a
-    user can edit it for a robot with non-standard link names.
+    先比较规范化精确名称，再尝试 YAML 和内置别名；同一个 body 不会分配给两路 IMU。
+    无法解析的项返回 ``None``。提供 ``output_path`` 时还会写出候选和 unresolved 列表，
+    方便用户为非标准 link 名人工修订。
+
+    Returns:
+        六个 ``imu_XX`` 到真实 body 名或 ``None`` 的映射。
     """
 
     if mapping is None or isinstance(mapping, (str, Path)):
@@ -773,7 +817,7 @@ def resolve_imu_mapping(
 
 
 def _parse_time(value: Any) -> float:
-    """Parse recorder timestamps, numeric seconds, or ``device+00T...`` strings."""
+    """把数值秒、ISO 时间或 ``device+00T...`` 记录器时间解析为秒。"""
 
     if value is None:
         return float("nan")
@@ -786,7 +830,7 @@ def _parse_time(value: Any) -> float:
         return float(text)
     except ValueError:
         pass
-    # Handles ISO timestamps and the recorder's ``device+00T00:10:00.005``.
+    # 同时处理 ISO 时间戳和记录仪的 ``device+00T00:10:00.005`` 格式。
     match = re.search(r"(?:T|^)(\d{1,3}):(\d{2}):(\d{2}(?:\.\d+)?)", text)
     if match:
         return float(match.group(1)) * 3600.0 + float(match.group(2)) * 60.0 + float(match.group(3))
@@ -797,6 +841,8 @@ def _parse_time(value: Any) -> float:
 
 
 def _column(row: Mapping[str, str], *names: str) -> float:
+    """读取一行中首个非空别名列；缺失或无法转换时返回 ``NaN``。"""
+
     for name in names:
         value = row.get(name)
         if value is not None and str(value).strip() != "":
@@ -814,11 +860,25 @@ def _read_imu_csv(
     *,
     sensor_index: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """Read one IMU CSV and map its channels to the simulation frame.
+    """读取一份 IMU CSV，并转换到仿真坐标系。
 
-    ``sensor_index`` is the one-based recorder ID.  Supplying it enables the
-    left/right leg axis matrices; omitting it retains the legacy global-sign
-    behavior for standalone callers and old conversion scripts.
+    函数识别多种历史列名，将 dps/degree 转成 SI 单位，按时间稳定排序、插补缺失单元，
+    并去除重复时间戳。``sensor_index`` 是一基记录仪编号；提供后使用左右腿矩阵，
+    省略则保留旧转换脚本使用的全局符号模式。
+
+    Args:
+        path: 单路 ``*_imu_XX.csv`` 文件。
+        target_dt_s: CSV 无可用时间列时采用的样本间隔 [s]。
+        calibration: 坐标标定；``None`` 使用默认标定。
+        sensor_index: 可选的一基编号 1--6。
+
+    Returns:
+        包含 ``t_s[N]``、``orientation[N,3]`` [rad]、``gyro[N,3]`` [rad/s] 和
+        ``accel[N,3]`` [m/s^2] 的 ``float32`` 数组字典（时间为 ``float64``）。
+
+    Raises:
+        DatasetFormatError: CSV 没有数据行或时间字段无法解析。
+        OSError: 文件无法读取。
     """
 
     calibration = calibration or SensorCoordinateCalibration()
@@ -845,9 +905,10 @@ def _read_imu_csv(
     times = times[order]
 
     def values(*prefixes: str) -> np.ndarray:
-        # Match a prefix only at a field boundary.  A plain alias such as
-        # ``gy`` must not also match ``gyro_x_dps``/``gyro_y_dps``/``gyro_z_dps``
-        # and silently make all three axes read the first column.
+        """按候选列名前缀读取排序后的单通道 ``float64[N]`` 数组。"""
+
+        # 前缀只能在字段边界匹配。像 ``gy`` 这样的短别名不能同时匹配
+        # ``gyro_x_dps``/``gyro_y_dps``/``gyro_z_dps``，否则三个轴会悄悄读到第一列。
         names = [
             name
             for name in columns
@@ -858,7 +919,7 @@ def _read_imu_csv(
                 for prefix in prefixes
             )
         ]
-        # Prefer the explicitly named canonical column when available.
+        # 若存在名称完全一致的 canonical 列，则优先使用它。
         for prefix in prefixes:
             exact = next((name for name in columns if name.lower() == prefix.lower()), None)
             if exact is not None:
@@ -883,8 +944,8 @@ def _read_imu_csv(
         ),
         axis=-1,
     )
-    # The recorder's columns are *_dps.  Generic gyro columns are also dps;
-    # only an explicit *_rad_s/rads suffix is treated as SI already.
+    # 记录仪列名为 *_dps，通用 gyro 列也按 dps 解释；只有显式的 *_rad_s/rads 后缀
+    # 才表示数值已经是 SI 单位。
     if not any("rad" in name.lower() for name in columns if name.lower().startswith("gyro_")):
         gyro *= math.pi / 180.0
     orientation = np.stack(
@@ -897,14 +958,10 @@ def _read_imu_csv(
     )
     if not any("rad" in name.lower() for name in columns if name.lower().startswith(("roll", "pitch", "yaw"))):
         orientation *= math.pi / 180.0
-    # Apply the frame calibration before interpolation/fill so every sample,
-    # including values synthesized for a missing cell, follows one convention.
-    orientation, gyro, acc = calibration.apply_imu(
-        orientation, gyro, acc, sensor_index=sensor_index
-    )
+    # 插值/填补前先应用坐标系标定，使每个样本（包括为缺失单元合成的值）遵循同一约定。
+    orientation, gyro, acc = calibration.apply_imu(orientation, gyro, acc, sensor_index=sensor_index)
     for array in (acc, gyro, orientation):
-        # A malformed cell should not destroy a whole trial.  Hold the nearest
-        # finite value, or use zero when an entire channel is absent.
+        # 单个非法单元不应毁掉整段 trial：保持最近的有限值；整条通道都缺失时才使用零。
         for channel in range(array.shape[1]):
             finite = np.isfinite(array[:, channel])
             if not finite.any():
@@ -921,6 +978,18 @@ def _read_imu_csv(
 
 
 def _resample_channels(source_t: np.ndarray, values: np.ndarray, target_t: np.ndarray) -> np.ndarray:
+    """把任意尾部 shape 的连续通道线性重采样到统一时间轴。
+
+    Args:
+        source_t: shape ``[S]`` 的源时间 [s]，应已排序且唯一。
+        values: shape ``[S, ...]`` 的通道值。
+        target_t: shape ``[T]`` 的目标时间 [s]。
+
+    Returns:
+        shape ``[T, ...]`` 的 ``float32`` 数组。全缺失通道填零，单点通道保持常值，
+        超出源时间范围的部分保持首/末有效值。
+    """
+
     result = np.empty((target_t.size, *values.shape[1:]), dtype=np.float32)
     for index in np.ndindex(values.shape[1:]):
         source = values[(slice(None), *index)]
@@ -937,6 +1006,8 @@ def _resample_channels(source_t: np.ndarray, values: np.ndarray, target_t: np.nd
 
 
 def _resolve_path(trial_dir: Path, root: Path, value: Any) -> Path | None:
+    """在 trial、数据根目录和绝对路径中解析媒体引用；找不到时返回 ``None``。"""
+
     if value is None:
         return None
     raw = str(value).replace("\\", "/")
@@ -952,6 +1023,8 @@ def _resolve_path(trial_dir: Path, root: Path, value: Any) -> Path | None:
 
 
 def _find_metadata(trial_dir: Path) -> Path | None:
+    """返回 trial 中首个含 ``task`` 或 ``files`` 字段的 JSON 元数据文件。"""
+
     for path in sorted(trial_dir.glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -963,6 +1036,8 @@ def _find_metadata(trial_dir: Path) -> Path | None:
 
 
 def _discover_motion(trial_dir: Path, metadata_path: Path | None) -> Path | None:
+    """按文件名关键字发现可选关节运动文件，并排除元数据、IMU 和压力记录。"""
+
     tokens = ("motion", "joint", "kinematic", "q_rad", "qpos")
     for path in sorted(trial_dir.iterdir()):
         if (
@@ -978,7 +1053,11 @@ def _discover_motion(trial_dir: Path, metadata_path: Path | None) -> Path | None
 
 
 def _motion_mapping(payload: Mapping[str, Any]) -> tuple[Any, Any, Any] | None:
+    """从字段别名或嵌套对象提取 ``(时间, 关节角, 关节速度)`` 原始值。"""
+
     def pick(*names: str):
+        """返回映射中首个存在的别名值；全部缺失时返回 ``None``。"""
+
         return next((payload[name] for name in names if name in payload), None)
 
     position = pick("joint_pos_rad", "joint_pos", "q_rad", "q", "joint_position")
@@ -987,8 +1066,10 @@ def _motion_mapping(payload: Mapping[str, Any]) -> tuple[Any, Any, Any] | None:
         if isinstance(nested, Mapping):
             return _motion_mapping(nested)
         return None
-    return pick("t_s", "time_s", "time", "timestamps_s"), position, pick(
-        "joint_vel_rad_s", "joint_vel", "qdot_rad_s", "qdot"
+    return (
+        pick("t_s", "time_s", "time", "timestamps_s"),
+        position,
+        pick("joint_vel_rad_s", "joint_vel", "qdot_rad_s", "qdot"),
     )
 
 
@@ -997,7 +1078,23 @@ def _read_motion(
     target_dt_s: float,
     joint_sign: Sequence[float] = DEFAULT_JOINT_SIGN,
 ) -> MotionSeries | None:
-    """Read a motion file and apply the canonical joint-direction calibration."""
+    """读取可选关节轨迹，并应用 canonical 关节方向标定。
+
+    支持 NPZ、PyTorch、JSON 与 CSV。位置是必需字段，速度缺失时使用时间梯度估算；
+    文件内 ``joint_sign`` 可覆盖数据集级符号，适用于某次更换编码器后的记录。
+
+    Args:
+        path: 运动文件路径。
+        target_dt_s: 缺少时间字段时采用的采样间隔 [s]。
+        joint_sign: 八个关节的默认方向符号。
+
+    Returns:
+        校准后的 :class:`MotionSeries`；格式不受支持、没有位置字段或少于两个有效样本
+        时返回 ``None``。
+
+    Raises:
+        DatasetFormatError: 存在运动数据但 shape、时间长度或符号配置不合法。
+    """
 
     joint_sign = _validated_signs(joint_sign, 8, "joint_sign", DEFAULT_JOINT_SIGN)
     suffix = path.suffix.lower()
@@ -1046,9 +1143,8 @@ def _read_motion(
                 }
     if payload is None:
         return None
-    # A motion file may carry its own calibration metadata.  It overrides the
-    # dataset-level default for that trial, which is useful after an encoder
-    # replacement while preserving compatibility with older recordings.
+    # motion 文件可以携带自己的标定元数据，并仅为当前 trial 覆盖数据集默认值；这样更换
+    # 编码器后可以使用新标定，同时仍兼容旧记录。
     payload_sign = payload.get("joint_sign")
     if payload_sign is None:
         nested = next(
@@ -1105,6 +1201,8 @@ def _read_motion(
 
 
 def _read_pressure(path: Path, target_dt_s: float) -> tuple[np.ndarray, np.ndarray] | None:
+    """读取压力 CSV，返回时间 [s] 与归一化平均压力；不可读或为空时返回 ``None``。"""
+
     try:
         with path.open(newline="", encoding="utf-8-sig") as stream:
             rows = list(csv.DictReader(stream))
@@ -1137,11 +1235,21 @@ def _read_pressure(path: Path, target_dt_s: float) -> tuple[np.ndarray, np.ndarr
 
 
 def _load_event_file(path: Path) -> np.ndarray | None:
-    """Load events as ``[N, 4] = (x, y, time_s, polarity)``.
+    """把事件文件解码为 ``[N,4] = (x,y,time_s,polarity)``。
 
-    AEDAT4 support is optional and uses ``dv-processing`` when installed.  A
-    preview MP4 is intentionally rejected; deriving events by RGB differencing
-    would not represent the asynchronous sensor that was recorded.
+    支持 NPZ/NPY、CSV、JSON 和可选 ``dv-processing`` 解码的 AEDAT4。时间戳会归一化
+    为从零开始的秒，极性规范为 ``-1/+1``。预览视频会明确返回 ``None``，因为 RGB
+    帧差不等于真实异步事件。
+
+    Args:
+        path: 左或右事件文件。
+
+    Returns:
+        ``float32[N,4]`` 数组；不支持的视频、缺少原生解码器或解码失败时返回
+        ``None``。合法但安静的记录返回 shape ``[0,4]``，两者语义不同。
+
+    Raises:
+        DatasetFormatError: 已解码内容不是至少四列的二维数组。
     """
 
     suffix = path.suffix.lower()
@@ -1158,8 +1266,12 @@ def _load_event_file(path: Path) -> np.ndarray | None:
         with path.open(newline="", encoding="utf-8-sig") as stream:
             rows = list(csv.DictReader(stream))
         if rows:
+
             def get(row: Mapping[str, str], *names: str) -> float:
+                """按事件列别名读取浮点值，缺失或非法时返回 ``NaN``。"""
+
                 return _column(row, *names)
+
             events = np.asarray(
                 [
                     [
@@ -1199,10 +1311,7 @@ def _load_event_file(path: Path) -> np.ndarray | None:
                 if array is not None and len(array):
                     names = array.dtype.names or ()
                     rows.extend(
-                        [
-                            [item["x"], item["y"], item["timestamp"], item["polarity"]]
-                            for item in array
-                        ]
+                        [[item["x"], item["y"], item["timestamp"], item["polarity"]] for item in array]
                         if names
                         else np.asarray(array).tolist()
                     )
@@ -1220,7 +1329,7 @@ def _load_event_file(path: Path) -> np.ndarray | None:
     array = array[finite]
     if not len(array):
         return np.zeros((0, 4), dtype=np.float32)
-    # AEDAT timestamps are commonly microseconds; normalize to seconds.
+    # AEDAT 时间戳通常使用微秒，这里统一换算为秒。
     magnitude = float(np.nanmax(np.abs(array[:, 2])))
     if magnitude > 1.0e5:
         array[:, 2] *= 1.0e-6
@@ -1230,26 +1339,21 @@ def _load_event_file(path: Path) -> np.ndarray | None:
 
 
 class ExoskeletonImitationDataset(Dataset):
-    """Time-synchronized windows from the recorded exoskeleton trials.
+    """从外骨骼实测 trial 中提供时间同步窗口的 PyTorch 数据集。
 
-    Parameters are intentionally independent of Isaac Lab.  ``task_id`` may be
-    one ID, an iterable of IDs, or ``None`` for all tasks.  With
-    ``random_task_sampling=True`` each item samples a task/trial uniformly;
-    otherwise indexing walks through the discovered trials.  Optional media is
-    returned as zero-filled tensors plus validity flags when a decoder is not
-    installed, which keeps PyTorch collation deterministic.
+    类本身不依赖 Isaac Lab。``task_id`` 可为单个编号、编号序列或全部任务。随机模式
+    使用 ``seed + epoch + index/抽样计数`` 构造可复现随机流；顺序模式则遍历每个
+    trial 的所有合法起点。缺少可选媒体或解码器时仍返回固定 shape 零张量，同时把
+    对应 ``valid`` 设为 ``False``，保证 PyTorch 批处理不会因键或 shape 变化而失败。
 
-    ``calibration_path`` selects the YAML sign map used for IMU axes and the
-    eight canonical joint channels.  With ``None`` the repository default is
-    loaded automatically.
+    ``calibration_path`` 决定 IMU 轴和八关节方向映射；``None`` 自动使用仓库默认值。
+    非媒体数据在构造时读取，RGB 和 Event 在 :meth:`_sample_record` 中延迟解码。
 
-    A returned event stream has ``target_event_stream[N, 4]`` columns
-    ``(x, y, t_relative_s, polarity)``; ``target_event_frame_index[N]`` maps
-    each event to its policy-rate window bin, and ``target_event`` is the
-    fixed-size ``[window, 2 cameras, 2 polarities, H, W]`` histogram used by
-    PPO.  Summing the camera axis produces a combined two-polarity histogram.
-    ``event_source_size`` uses ``(height, width)`` and defaults to the
-    320x240 DVXplorer sensor used by the supplied recordings.
+    返回的事件流 ``target_event_stream[N,4]`` 四列为
+    ``(x, y, t_relative_s, polarity)``；``target_event_frame_index[N]`` 把
+    每个事件映射到策略频率窗口，``target_event`` 则是 PPO 可批处理的
+    ``[window,2 cameras,2 polarities,H,W]`` 计数直方图。``event_source_size`` 使用
+    ``(height,width)``，默认对应数据中的 240x320 DVXplorer。
     """
 
     def __init__(
@@ -1272,6 +1376,33 @@ class ExoskeletonImitationDataset(Dataset):
         task_mapping_path: str | Path | None = None,
         calibration_path: str | Path | None = None,
     ) -> None:
+        """发现、校验并索引数据集中的 trial。
+
+        Args:
+            root: 包含 ``Trial*`` 子目录的数据集根目录。
+            task_id: 一个或多个 BT/AT 编号；``None``/``all``/``none`` 表示全部。
+            window_size: 每个样本包含的策略时间步数。
+            target_dt_s: 统一后的策略采样间隔 [s]，默认 ``0.02`` 即 50 Hz。
+            random_window: 是否随机选择 trial 内的窗口起点。
+            random_task_sampling: 未指定任务时是否先均匀抽任务，再抽 trial。
+            steps_per_epoch: 可选的 ``__len__`` 固定值，便于控制训练 epoch 长度。
+            seed: 随机窗口的基础种子。
+            rgb_size: RGB 输出 ``(height,width)`` [pixel]。
+            event_size: 事件直方图输出 ``(height,width)`` [bin]。
+            event_source_size: 原始事件传感器 ``(height,width)`` [pixel]；``None`` 从
+                当前事件坐标范围保守推断。
+            load_rgb: 是否在采样窗口时延迟读取 RGB。
+            load_event: 是否在采样窗口时延迟解码事件。
+            strict: ``True`` 时遇到坏 trial 立即报错；否则记录警告并跳过。
+            task_mapping_path: 可选任务名称 YAML。
+            calibration_path: 可选坐标/方向标定 YAML。
+
+        Raises:
+            ValueError: 时间间隔、窗口或图像尺寸不合法，或任务编号未知。
+            FileNotFoundError: 数据集根目录或显式标定文件不存在。
+            DatasetFormatError: 没有可用 trial，或严格模式下发现格式错误。
+        """
+
         if target_dt_s <= 0.0:
             raise ValueError("target_dt_s must be positive")
         if window_size <= 0:
@@ -1292,9 +1423,7 @@ class ExoskeletonImitationDataset(Dataset):
         self.epoch = 0
         self.rgb_size = tuple(int(value) for value in rgb_size)
         self.event_size = tuple(int(value) for value in event_size)
-        self.event_source_size = (
-            None if event_source_size is None else tuple(int(value) for value in event_source_size)
-        )
+        self.event_source_size = None if event_source_size is None else tuple(int(value) for value in event_source_size)
         self.load_rgb = bool(load_rgb)
         self.load_event = bool(load_event)
         self.strict = bool(strict)
@@ -1308,12 +1437,13 @@ class ExoskeletonImitationDataset(Dataset):
         self._video_captures: dict[Path, Any] = {}
         self._event_cache: dict[Path, np.ndarray | None] = {}
         self._epoch_cache: dict[int, list[tuple[int, int]]] = {}
-        # ``sample()`` is called from environment resets rather than through a
-        # PyTorch DataLoader, so an internal counter is needed to avoid drawing
-        # the identical seeded window on every reset.
+        # ``sample()`` 由环境 reset 直接调用，而不是经 PyTorch DataLoader 调用，因此需要
+        # 内部计数器，避免每次 reset 都抽到完全相同的 seeded 窗口。
         self._sample_counter = 0
 
     def _normalise_task_ids(self, task_id: str | Sequence[str] | None) -> tuple[str, ...]:
+        """把单个、多个或 ``all`` 任务选择规范为已校验的大写任务编号元组。"""
+
         if task_id is None or str(task_id).lower() in {"", "all", "none"}:
             return TASK_IDS
         if isinstance(task_id, str):
@@ -1327,6 +1457,16 @@ class ExoskeletonImitationDataset(Dataset):
         return result
 
     def _discover_trials(self) -> list[TrialRecord]:
+        """递归发现 ``Trial*`` 目录并加载可用的非媒体通道。
+
+        Returns:
+            按目录名排序的 :class:`TrialRecord` 列表。
+
+        Raises:
+            DatasetFormatError: 根路径不是目录，或严格模式下无法判断任务编号。
+            OSError: 严格模式下底层文件读取失败。
+        """
+
         if self.root.is_file():
             raise DatasetFormatError("dataset root must be a directory containing task trials")
         trial_dirs = sorted({path for path in self.root.rglob("Trial*") if path.is_dir()})
@@ -1375,6 +1515,27 @@ class ExoskeletonImitationDataset(Dataset):
         metadata_path: Path | None,
         payload: Mapping[str, Any],
     ) -> TrialRecord:
+        """把一个 trial 的六路 IMU、压力和运动轨迹对齐到同一时间轴。
+
+        六路 IMU 先各自解析，再取共同时间区间并以 ``target_dt_s`` 重采样。缺失某一路
+        时填 ``[T,3]`` 零值并将对应 ``imu_valid`` 设为 ``False``。RGB/Event 此时只
+        记录路径；关节运动若存在则立即解析和对齐。
+
+        Args:
+            trial_dir: 当前 ``TrialXX`` 目录。
+            task_id: 已确认的 BT/AT 任务编号。
+            subject_id: 元数据或目录推断出的受试者编号。
+            metadata_path: 可选元数据 JSON 路径。
+            payload: 已读取的元数据映射。
+
+        Returns:
+            时间从零开始、非媒体通道已同步的 :class:`TrialRecord`。
+
+        Raises:
+            DatasetFormatError: 六路腿部 IMU 全部缺失或必需数据无法解释。
+            OSError: 必需文件无法读取。
+        """
+
         files = payload.get("files", {}) if isinstance(payload.get("files"), Mapping) else {}
         imu_sources: list[dict[str, np.ndarray] | None] = []
         for index in range(1, 7):
@@ -1441,9 +1602,9 @@ class ExoskeletonImitationDataset(Dataset):
                 pressure = _read_pressure(path, self.target_dt_s)
                 if pressure is not None:
                     pressure_t, pressure_values = pressure
-                    contact[:, side] = _resample_channels(
-                        pressure_t, pressure_values[:, None], target_absolute
-                    )[:, 0].clip(0.0, 1.0)
+                    contact[:, side] = _resample_channels(pressure_t, pressure_values[:, None], target_absolute)[
+                        :, 0
+                    ].clip(0.0, 1.0)
 
         rgb_paths: dict[str, Path] = {}
         event_paths: dict[str, Path] = {}
@@ -1456,7 +1617,7 @@ class ExoskeletonImitationDataset(Dataset):
             if rgb is not None:
                 rgb_paths[side] = rgb
             event = _resolve_path(trial_dir, self.root, files.get(f"{side}_event"))
-            # Metadata points to *_event_preview.mp4.  Prefer the original AEDAT4.
+            # 元数据指向 *_event_preview.mp4 时，优先寻找原始 AEDAT4 文件。
             event_candidates = [path for path in trial_dir.glob(f"{side}_*.aedat4")]
             if event_candidates:
                 event = sorted(event_candidates)[0]
@@ -1504,27 +1665,29 @@ class ExoskeletonImitationDataset(Dataset):
 
     @staticmethod
     def _resample_motion(motion: MotionSeries, target_t: np.ndarray) -> MotionSeries:
+        """把关节角和可选关节速度线性重采样到目标时间 ``target_t`` [s]。"""
+
         position = _resample_channels(motion.t_s, motion.joint_pos_rad, target_t)
         velocity = (
-            None
-            if motion.joint_vel_rad_s is None
-            else _resample_channels(motion.t_s, motion.joint_vel_rad_s, target_t)
+            None if motion.joint_vel_rad_s is None else _resample_channels(motion.t_s, motion.joint_vel_rad_s, target_t)
         )
         return MotionSeries(target_t.astype(np.float32), position, velocity)
 
     def set_epoch(self, epoch: int) -> None:
-        """Change the deterministic random stream used by random windows."""
+        """切换随机窗口的确定性随机流，并把环境抽样计数归零。"""
 
         self.epoch = int(epoch)
         self._sample_counter = 0
 
     @property
     def task_ids(self) -> tuple[str, ...]:
-        """Task IDs represented by discovered trials."""
+        """返回已发现 trial 实际包含的排序后任务编号。"""
 
         return tuple(sorted({record.task_id for record in self.trials}))
 
     def __len__(self) -> int:
+        """返回当前 epoch 可索引的窗口数；随机模式至少返回一个样本。"""
+
         if self.steps_per_epoch is not None:
             return max(1, int(self.steps_per_epoch))
         if self.random_window or self.random_task_sampling:
@@ -1532,6 +1695,18 @@ class ExoskeletonImitationDataset(Dataset):
         return sum(max(1, record.length - self.window_size + 1) for record in self.trials)
 
     def _index_to_trial_start(self, index: int) -> tuple[int, int]:
+        """把 PyTorch 样本索引映射为 ``(trial索引, 窗口起点)``。
+
+        随机模式仍由 ``seed``、``epoch`` 和 ``index`` 唯一决定，所以同一输入可复现；
+        顺序模式会把所有 trial 的窗口数视作一段连续索引空间。
+
+        Args:
+            index: ``Dataset.__getitem__`` 收到的整数索引。
+
+        Returns:
+            ``(trial_index, start_sample)``，两项均为零基整数。
+        """
+
         if self.random_task_sampling:
             rng = random.Random(self.seed + self.epoch * 1_000_003 + int(index))
             trial_index = rng.randrange(len(self.trials))
@@ -1552,6 +1727,8 @@ class ExoskeletonImitationDataset(Dataset):
         return len(self.trials) - 1, max(0, self.trials[-1].length - self.window_size)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        """把整数索引解析为 trial 窗口，并返回一份训练样本字典。"""
+
         trial_index, start = self._index_to_trial_start(index)
         return self._sample_record(self.trials[trial_index], start)
 
@@ -1564,7 +1741,25 @@ class ExoskeletonImitationDataset(Dataset):
         trial_id: str | None = None,
         random_window: bool | None = None,
     ) -> dict[str, Any]:
-        """Sample a task/timestamp window for environment-side playback."""
+        """按任务、trial 或时间戳为环境抽取一个窗口。
+
+        这个接口主要由环境 reset 调用，不经过 ``DataLoader.__getitem__``，因此使用
+        内部递增计数让同一 epoch 中连续 reset 不会永远拿到同一随机窗口。
+
+        Args:
+            task_id: 可选 BT/AT 编号；``None`` 允许从全部已加载任务中选择。
+            timestamp_s: 可选窗口起始时间 [s]；提供后选择不早于该时刻的样本。
+            window_size: 临时覆盖默认窗口长度。
+            trial_id: 可选 ``TrialXX`` 名称过滤。
+            random_window: 临时覆盖随机起点设置。
+
+        Returns:
+            包含元数据、同步目标张量和各模态有效掩码的字典。
+
+        Raises:
+            KeyError: 没有 trial 同时满足任务和 trial 过滤条件。
+            ValueError: ``window_size`` 不是正数。
+        """
 
         requested = None if task_id is None else str(task_id).upper()
         candidates = [record for record in self.trials if requested is None or record.task_id == requested]
@@ -1572,9 +1767,8 @@ class ExoskeletonImitationDataset(Dataset):
             candidates = [record for record in candidates if record.trial_id == trial_id]
         if not candidates:
             raise KeyError(f"no trial matches task_id={task_id!r}, trial_id={trial_id!r}")
-        # Include a monotonically increasing draw index.  This remains
-        # reproducible for a fixed seed/epoch while ensuring independent reset
-        # calls do not reuse one frozen target window.
+        # 把单调递增的抽样序号加入随机种子：固定 seed/epoch 时仍可复现，同时确保各次独立
+        # reset 不会重复使用同一个冻结目标窗口。
         draw_index = self._sample_counter
         self._sample_counter += 1
         rng = random.Random(self.seed + self.epoch * 1_000_003 + draw_index)
@@ -1598,11 +1792,30 @@ class ExoskeletonImitationDataset(Dataset):
         return self._sample_record(record, start, size)
 
     def sample_at(self, task_id: str, timestamp_s: float, window_size: int | None = None) -> dict[str, Any]:
-        """Alias for timestamp-addressed sampling used by training commands."""
+        """按确定时间戳采样的便捷别名，强制关闭随机窗口。"""
 
         return self.sample(task_id, timestamp_s, window_size=window_size, random_window=False)
 
     def _sample_record(self, record: TrialRecord, start: int, size: int | None = None) -> dict[str, Any]:
+        """从单个 trial 组装完整训练样本，并按需解码媒体。
+
+        超过 trial 末尾的窗口位置重复最后一帧，从而始终返回请求的 ``size``。运动
+        文件缺失时 ``target_motion/velocity`` 为零且 ``motion_valid=False``。
+
+        Args:
+            record: 已加载非媒体通道的 trial。
+            start: 零基窗口起始样本。
+            size: 可选窗口长度；``None`` 使用数据集默认值。
+
+        Returns:
+            主要 shape 为：时间 ``[W]``、运动 ``[W,8]``、IMU ``[W,6,9]``、接触
+            ``[W,2]``、RGB ``[W,2,3,H,W]``、事件直方图 ``[W,2,2,H,W]``；事件原始
+            流长度记为 ``E``，对应 ``[E,4]`` 及两个 ``[E]`` 索引。
+
+        Raises:
+            ValueError: 有效窗口长度不是正数。
+        """
+
         size = self.window_size if size is None else int(size)
         if size <= 0:
             raise ValueError("window_size must be positive")
@@ -1647,6 +1860,18 @@ class ExoskeletonImitationDataset(Dataset):
         }
 
     def _sample_rgb(self, record: TrialRecord, t_window: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        """按窗口时间延迟读取左右 RGB 帧。
+
+        Args:
+            record: 提供左右 RGB 文件路径的 trial。
+            t_window: shape ``[W]`` 的目标时间 [s]。
+
+        Returns:
+            ``(frames, valid)``：frames 是归一化到 ``[0,1]`` 的
+            ``float32[W,2,3,H,W]``，valid 是左右相机 ``bool[2]``。一路中任一目标帧
+            解码失败时，该路保持全零并标为无效。
+        """
+
         height, width = self.rgb_size
         output = torch.zeros((len(t_window), 2, 3, height, width), dtype=torch.float32)
         valid = torch.zeros(2, dtype=torch.bool)
@@ -1669,6 +1894,20 @@ class ExoskeletonImitationDataset(Dataset):
         return output, valid
 
     def _read_video_frame(self, path: Path, time_s: float) -> torch.Tensor | None:
+        """读取并缩放某一时刻的一张 RGB 帧。
+
+        NPY/NPZ 直接按策略时间索引；视频优先复用 imageio reader，失败后复用 OpenCV
+        capture。两种解码器都不可用或帧格式非法时返回 ``None``，不会抛出并中断整个
+        trial。
+
+        Args:
+            path: NPY/NPZ 图像数组或视频文件。
+            time_s: 相对 trial 起点的目标时间 [s]。
+
+        Returns:
+            ``float32[3,H,W]``、值域 ``[0,1]`` 的 RGB 张量；失败时返回 ``None``。
+        """
+
         try:
             if path.suffix.lower() in {".npy", ".npz"}:
                 loaded = np.load(path, allow_pickle=False)
@@ -1683,6 +1922,7 @@ class ExoskeletonImitationDataset(Dataset):
             else:
                 try:
                     import imageio.v2 as imageio
+
                     reader = self._video_readers.get(path)
                     if reader is None:
                         reader = imageio.get_reader(str(path))
@@ -1690,11 +1930,9 @@ class ExoskeletonImitationDataset(Dataset):
                     metadata = reader.get_meta_data()
                     fps = float(metadata.get("fps", 30.0) or 30.0)
                     image = reader.get_data(max(0, int(round(time_s * fps))))
-                except Exception as imageio_exc:  # optional ffmpeg/PyAV decoder
-                    # OpenCV is a common Isaac/ROS dependency and can decode
-                    # the supplied MP4 files even when imageio's ffmpeg plugin
-                    # is absent.  It is a decoder fallback only; event files
-                    # never pass through this path.
+                except Exception as imageio_exc:  # 可选 ffmpeg/PyAV 解码器
+                    # OpenCV 是常见的 Isaac/ROS 依赖；即使缺少 imageio 的 ffmpeg 插件，
+                    # 也能解码提供的 MP4。它只作为视频解码后备，事件文件不会进入此路径。
                     try:
                         import cv2
 
@@ -1736,6 +1974,20 @@ class ExoskeletonImitationDataset(Dataset):
     def _sample_events(
         self, record: TrialRecord, start_s: float, end_s: float, window_size: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        """延迟解码并截取窗口内左右事件，生成固定直方图。
+
+        Args:
+            record: 含左右事件文件路径的 trial。
+            start_s: 窗口起点 [s]。
+            end_s: 窗口右开区间终点 [s]。
+            window_size: 策略时间 bin 数。
+
+        Returns:
+            五元组 ``(histogram, stream, frame_index, camera_index, valid)``。shape 分别为
+            ``[W,2,2,H,W]``、``[E,4]``、``[E]``、``[E]`` 和布尔值。成功解码但本
+            窗口事件数为零时 ``valid`` 仍为 ``True``；缺失/损坏/不支持才为 ``False``。
+        """
+
         height, width = self.event_size
         histogram = torch.zeros((window_size, 2, 2, height, width), dtype=torch.float32)
         if not self.load_event or not record.event_paths:
@@ -1788,23 +2040,28 @@ class ExoskeletonImitationDataset(Dataset):
             stream = torch.zeros((0, 4), dtype=torch.float32)
             event_frame_index = torch.zeros(0, dtype=torch.long)
             event_camera_index = torch.zeros(0, dtype=torch.long)
-        # A successfully decoded DVS recording is valid even when this short
-        # window contains no threshold crossings.  A zero-event interval is
-        # an observable quiet scene, whereas ``False`` is reserved for a
-        # missing/unsupported/corrupt event stream (handled above).
+        # DVS 记录只要成功解码，即使短窗口内没有阈值越过也仍然有效。零事件区间表示可观测
+        # 的安静场景；``False`` 只表示事件流缺失、不受支持或损坏（已在上方处理）。
         return histogram, stream, event_frame_index, event_camera_index, True
 
     def _event_grid_coordinates(
         self, x: np.ndarray, y: np.ndarray, width: int, height: int
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Map source-sensor pixels to the fixed PPO event grid.
+        """把原始传感器像素缩放到 PPO 固定事件网格。
 
-        DVXplorer recordings in the supplied dataset use 320x240 pixels.  The
-        target histogram is normally 64x64, so clipping raw coordinates would
-        collapse almost all events onto the last row/column.  ``None`` opts
-        into conservative inference from the observed coordinate extent; the
-        default keeps a stable calibration even when a short window does not
-        visit every source pixel.
+        数据中的 DVXplorer 是 320x240，而目标通常是 64x64；直接裁剪会让大部分事件
+        堆到最后一行/列，因此这里按源分辨率缩放。源尺寸为 ``None`` 时才根据当前
+        坐标范围推断；默认固定尺寸可避免短窗口没覆盖边缘像素造成比例漂移。
+
+        Args:
+            x: 原始水平像素坐标 ``[E]``。
+            y: 原始垂直像素坐标 ``[E]``。
+            width: 目标网格宽度。
+            height: 目标网格高度。
+
+        Returns:
+            两个 ``int64[E]`` 数组，分别是裁剪到 ``[0,width-1]`` 和
+            ``[0,height-1]`` 的网格坐标。
         """
 
         if self.event_source_size is None:
@@ -1817,7 +2074,11 @@ class ExoskeletonImitationDataset(Dataset):
         return scaled_x.clip(0, width - 1), scaled_y.clip(0, height - 1)
 
     def close(self) -> None:
-        """Release open video readers."""
+        """释放延迟解码期间缓存的 imageio/OpenCV 视频句柄。
+
+        Returns:
+            无返回值。重复调用安全，单个解码器关闭失败不会阻止其他句柄释放。
+        """
 
         for reader in self._video_readers.values():
             with contextlib.suppress(Exception):
@@ -1829,6 +2090,8 @@ class ExoskeletonImitationDataset(Dataset):
         self._video_captures.clear()
 
     def __del__(self):  # pragma: no cover - interpreter shutdown order is undefined
+        """对象回收时尽力关闭视频句柄；解释器退出阶段的异常会被忽略。"""
+
         with contextlib.suppress(Exception):
             self.close()
 

@@ -4,10 +4,12 @@ Isaac Lab 3.0 本身没有 DVS（Dynamic Vision Sensor，动态视觉传感器�
 环境配置先把 :class:`EventCameraCfg` 当作普通渲染相机创建；环境启动后，
 ``vision_sensor_cfg.make_dvs_runtime`` 可再把 EVIS ``dvs_gen`` 运行时接入本类。
 
-输入包括相机标定配置和可选 EVIS 运行时，输出 :class:`EventBatch`：事件张量最后一维
-依次为 ``(x, y, t, polarity)``，另有每个环境的有效标志。若 EVIS 未安装，模块仍允许
-IMU/RGB 等其他模态训练，但明确返回“空且无效”的事件流，绝不会用相邻 RGB 帧差伪造
-事件。启动顺序是渲染相机初始化 -> 可选运行时挂接 -> 每个观测周期读取事件批次。
+输入包括相机标定配置和可选 EVIS 运行时，输出 :class:`EventBatch`。适配器约定
+运行时返回的事件张量最后一维是 ``(x, y, t, polarity)``，但本类只透传运行时结果，
+不会自动验证该顺序、shape 或数值范围。当前 PPO 观测主路径并不调用 `event_batch()`，
+而是直接读取 EVIS processor 的 `last_masks` 正负极性平面并池化成固定特征。
+若 EVIS 未安装，本模块仍允许 IMU/RGB 等其他模态训练，但明确返回“空且无效”的
+事件流，不会用相邻 RGB 帧差伪造事件。
 """
 
 from __future__ import annotations
@@ -44,11 +46,12 @@ class EventCameraCfg(CameraCfg):
 
 @dataclass
 class EventBatch:
-    """把变长事件流包装成带有效掩码的批次。
+    """按运行时适配器约定，包装变长事件流与有效掩码。
 
     Attributes:
-        events: 事件数据，通常 shape 为 ``[num_envs, num_events, 4]``；最后一维是
-            ``(x, y, t, polarity)``。没有运行时时 ``num_events`` 为 ``0``。
+        events: 事件数据，适配器应提供 shape
+            ``[num_envs, num_events, 4]``，并把最后一维排成 ``(x, y, t, polarity)``。
+            本数据类不执行这些校验；没有运行时时 ``num_events`` 为 ``0``。
         valid: shape 为 ``[num_envs]`` 的布尔张量；``False`` 表示该环境没有可信事件。
     """
 
@@ -90,16 +93,18 @@ class EventCamera(Camera):
         self._event_runtime = runtime
 
     def event_batch(self) -> EventBatch:
-        """读取当前环境批次的 ``(x, y, t, polarity)`` 事件。
+        """按适配器约定读取当前环境批次的事件。
 
         EVIS 原始事件流长度可变，运行时桥接层可以返回已分箱的固定 shape 张量。
+        已挂接运行时时，本方法原样包装 ``events_for`` 的两个返回值，不校验事件列顺序、
+        shape、dtype 或有效掩码长度；这些都是运行时适配器的前置契约。
         没有运行时时，环境数量优先从传感器 view 获取，再回退到 prim 数量；随后在
         相机设备上创建 shape ``[num_envs, 0, 4]`` 的空事件和 ``[num_envs]`` 无效掩码。
 
         Returns:
-            :class:`EventBatch`。事件坐标和时间戳的具体尺度由 EVIS 标定负责；
+            :class:`EventBatch`。按适配器契约，事件坐标和时间戳尺度由 EVIS 标定负责，
             ``polarity`` 表示亮度变化方向。
-    """
+        """
 
         view = getattr(self, "_view", None)
         count = int(getattr(view, "count", 0) or getattr(self, "_num_envs", 0))

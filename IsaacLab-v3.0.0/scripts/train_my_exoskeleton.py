@@ -72,9 +72,7 @@ def _parse_sensor_bool(option: str, value: str) -> bool:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(
-        f"{option} expects one of 0, 1, true, false, yes, no, on, off; got {value!r}"
-    )
+    raise ValueError(f"{option} expects one of 0, 1, true, false, yes, no, on, off; got {value!r}")
 
 
 def _consume_sensor_cli_args(argv: list[str]) -> list[str]:
@@ -170,9 +168,8 @@ def _apply_sensor_scene_overrides(argv: list[str]) -> list[str]:
             continue
         for entity in entities:
             prefix = f"env.scene.{entity}="
-            # A direct scene override must not resurrect a channel explicitly
-            # disabled by ``--rgb=0``/``--event=0``.  Replace it in-place so
-            # Hydra receives one unambiguous value for the field.
+            # 直接覆盖场景时，不能重新启用已被 ``--rgb=0``/``--event=0`` 明确关闭的
+            # 通道。这里原位替换参数，使 Hydra 对该字段只收到一个没有歧义的值。
             result = [argument for argument in result if not argument.startswith(prefix)]
             result.append(f"{prefix}null")
     return result
@@ -255,8 +252,7 @@ def _consume_exoskeleton_cli_args(argv: list[str]) -> list[str]:
             imitation_task = normalized_task_id
             if explicit_tasks and explicit_tasks[0] != _IMITATION_GYM_TASK:
                 raise ValueError(
-                    "dataset task IDs require --task Isaac-MyExoskeleton-Imitation-v0; "
-                    f"got {explicit_tasks[0]!r}"
+                    f"dataset task IDs require --task Isaac-MyExoskeleton-Imitation-v0; got {explicit_tasks[0]!r}"
                 )
             remaining.extend(
                 [
@@ -267,16 +263,14 @@ def _consume_exoskeleton_cli_args(argv: list[str]) -> list[str]:
             if not explicit_tasks:
                 remaining.extend(["--task", _IMITATION_GYM_TASK])
         else:
-            # Backwards-compatible form: older workflows used --task_id for
-            # the Gym environment ID itself.
+            # 向后兼容：旧流程会把 --task_id 本身用作 Gym 环境 ID。
             if explicit_tasks and explicit_tasks[0] != task_id:
                 raise ValueError(f"--task and --task_id select different tasks: {explicit_tasks[0]!r} and {task_id!r}")
             if not explicit_tasks:
                 remaining.extend(["--task", task_id])
 
-    # Route the path to the namespace supported by the selected environment.
-    # The legacy flat config has only ``reference_data_path``; the imitation
-    # config owns ``imitation_dataset_path``.
+    # 把路径送到所选环境支持的配置命名空间。旧版平地配置只有
+    # ``reference_data_path``，模仿配置则拥有 ``imitation_dataset_path``。
     selected_task = explicit_tasks[0] if explicit_tasks else None
     selected_imitation = selected_task == _IMITATION_GYM_TASK or imitation_task is not None
     reference_overrides = [arg for arg in remaining if arg.startswith(_REFERENCE_PATH_OVERRIDE)]
@@ -289,17 +283,16 @@ def _consume_exoskeleton_cli_args(argv: list[str]) -> list[str]:
                 f"{_REFERENCE_PATH_OVERRIDE.rstrip('=')} or "
                 f"{_DATASET_PATH_OVERRIDE.rstrip('=')} override; provide only one"
             )
-        # repr() lets paths containing spaces, quotes, or ``=`` survive the
-        # project's scalar override parser as one string value.
+        # repr() 可让包含空格、引号或 ``=`` 的路径通过项目标量覆盖解析器时，仍保持为
+        # 一个完整字符串值。
         if selected_imitation:
             remaining.append(f"{_DATASET_PATH_OVERRIDE}{dataset_path!r}")
         else:
             remaining.append(f"{_REFERENCE_PATH_OVERRIDE}{dataset_path!r}")
         if not explicit_tasks and task_id is None:
             remaining.extend(["--task", _IMITATION_GYM_TASK])
-    # Keep this aggregate consumer as the single entrypoint for custom flags;
-    # callers that only know about the historical helper still get sensor
-    # switches removed before Hydra sees them.
+    # 统一由这个聚合函数消费自定义参数；即使调用者只认识旧版辅助函数，也能在参数
+    # 交给 Hydra 前移除传感器开关。
     return _consume_sensor_cli_args(remaining)
 
 
@@ -359,11 +352,11 @@ def main() -> int:
     import isaaclab_assets.my_exoskeleton  # noqa: F401
 
     argv = _consume_exoskeleton_cli_args(list(sys.argv[1:]))
-    # Keep the explicit stage for callers that replace the aggregate consumer;
-    # it is idempotent because the aggregate already removes sensor aliases.
+    # 为替换了聚合参数处理器的调用者保留这一显式步骤；聚合处理器已移除传感器别名，
+    # 因此重复调用不会改变结果。
     argv = _consume_sensor_cli_args(argv)
-    # Isaac Lab 3.0 uses ``--visualizer none`` for headless execution. Keep
-    # the task's documented ``--headless`` form compatible with prior releases.
+    # Isaac Lab 3.0 使用 ``--visualizer none`` 进行无界面运行；这里继续兼容任务文档和
+    # 旧版本使用的 ``--headless`` 写法。
     headless = "--headless" in argv
     argv = [arg for arg in argv if arg != "--headless"]
     if headless and "--visualizer" not in argv and not any(arg.startswith("--visualizer=") for arg in argv):

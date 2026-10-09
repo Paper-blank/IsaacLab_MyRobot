@@ -3,7 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Regression tests for the my_exoskeleton environment configuration."""
+"""外骨骼基础环境配置、奖励和安全边界的回归测试。
+
+本文件保护环境真正交给训练器的契约：初始姿态与 reset、8关节动作顺序和缩放、课程
+切换步数、奖励权重、左右膝镜像限位、接触模式、前进奖励和足部朝向。多数测试使用
+最小假环境直接调用奖励函数，目的是在不启动 Isaac Sim 的情况下验证数学和路由逻辑；
+它们不是在声称假张量能够代替最终的整机仿真测试。
+"""
 
 import torch
 from isaaclab_physx.sim.schemas import PhysxArticulationRootPropertiesCfg
@@ -29,7 +35,7 @@ from isaaclab_assets.tasks.robot_contract import (
 
 
 def test_exoskeleton_reset_restores_scene_and_starts_near_ground():
-    """Keep fall autoreset enabled and align the default root with the foot plane."""
+    """倒地自动重置应保持启用，默认根节点高度也应与脚底平面对齐。"""
     cfg = MyExoskeletonFlatEnvCfg()
 
     assert cfg.scene.robot.init_state.pos == (0.0, 0.0, 0.01)
@@ -42,21 +48,16 @@ def test_exoskeleton_reset_restores_scene_and_starts_near_ground():
     assert cfg.scene.robot.spawn.force_usd_conversion is True
     assert cfg.scene.robot.spawn.collision_type == "Convex Decomposition"
     assert cfg.scene.robot.spawn.merge_mesh is False
-    # Isaac Lab 3.0 moved PhysX-only schema cfgs out of ``isaaclab.sim``.
-    # Keep the direct class here so a deprecated forwarding alias cannot
-    # silently reintroduce a backend-incomplete self-collision configuration.
+    # Isaac Lab 3.0 已把 PhysX 专用 schema 配置移出 ``isaaclab.sim``。这里直接检查
+    # 目标类，防止弃用的转发别名悄悄重新引入后端不完整的自碰撞配置。
     assert isinstance(cfg.scene.robot.spawn.articulation_props, PhysxArticulationRootPropertiesCfg)
     assert cfg.scene.robot.spawn.articulation_props.enabled_self_collisions is True
-    assert cfg.scene.left_foot_contact.class_type == (
-        "isaaclab_assets.sensors.contact_sensor:NestedBodyContactSensor"
-    )
-    assert cfg.scene.right_foot_contact.class_type == (
-        "isaaclab_assets.sensors.contact_sensor:NestedBodyContactSensor"
-    )
+    assert cfg.scene.left_foot_contact.class_type == ("isaaclab_assets.sensors.contact_sensor:NestedBodyContactSensor")
+    assert cfg.scene.right_foot_contact.class_type == ("isaaclab_assets.sensors.contact_sensor:NestedBodyContactSensor")
 
 
 def test_action_contract_preserves_canonical_joint_order_and_per_joint_scales():
-    """The policy/action order must match the hardware and reference-data contract."""
+    """策略动作顺序必须与硬件和参考数据共同约定的关节顺序一致。"""
     cfg = MyExoskeletonFlatEnvCfg()
     action = cfg.actions.joint_pos
     assert action.joint_names == list(ACTUATED_JOINT_NAMES)
@@ -65,7 +66,7 @@ def test_action_contract_preserves_canonical_joint_order_and_per_joint_scales():
 
 
 def test_ruleresult_output_is_opt_in_and_keeps_the_eight_dimensional_actor_contract():
-    """The playback result is 24-D without changing the PPO action space."""
+    """回放结果可以是 24 维，但不能因此改变 PPO 的 8 维动作空间。"""
 
     cfg = MyExoskeletonFlatEnvCfg()
 
@@ -80,7 +81,7 @@ def test_ruleresult_output_is_opt_in_and_keeps_the_eight_dimensional_actor_contr
 
 
 def test_curriculum_switches_after_500_ppo_iterations():
-    """Keep the requested 500-iteration phase schedule explicit."""
+    """把 PPO 迭代数换算为环境步数，锁定每 500 轮才切换一次课程的边界。"""
     assert CURRICULUM_ITERATIONS_PER_PHASE == 500
     assert PPO_HORIZON_LENGTH == 32
     assert PHASE_2_START_STEP == 500 * 32
@@ -88,7 +89,7 @@ def test_curriculum_switches_after_500_ppo_iterations():
 
 
 def test_exoskeleton_uses_shared_and_routed_paper_reward_weights():
-    """Keep the safety penalty and representative shared/gait weights explicit."""
+    """安全惩罚以及代表性的共享/分步态奖励权重都应明确配置。"""
     cfg = MyExoskeletonFlatEnvCfg()
 
     assert cfg.rewards.termination_penalty.func.__name__ == "is_terminated"
@@ -113,7 +114,7 @@ def test_exoskeleton_uses_shared_and_routed_paper_reward_weights():
 
 
 def test_knee_limits_are_mirrored_and_use_side_specific_terms():
-    """A global [-2.25, 2.25] bound must not allow reverse knee bending."""
+    """全局 ``[-2.25, 2.25]`` 边界不得让膝关节向反方向弯折。"""
     cfg = MyExoskeletonFlatEnvCfg()
 
     assert KNEE_ARTICULATION_SIGNS == {"Rthigh_to_Rleg": -1.0, "Lthigh_to_Lleg": 1.0}
@@ -132,7 +133,7 @@ def test_knee_limits_are_mirrored_and_use_side_specific_terms():
 
 
 def test_leg_momentum_reward_uses_explicit_right_left_body_pairing():
-    """The momentum term must not split the full PhysX body array in half."""
+    """动量项不得简单地把完整 PhysX 刚体数组从中间一分为二。"""
     cfg = MyExoskeletonFlatEnvCfg()
     asset_cfg = cfg.rewards.leg_momentum_balance.params["asset_cfg"]
 
@@ -150,7 +151,7 @@ def test_leg_momentum_reward_uses_explicit_right_left_body_pairing():
 
 
 def test_leg_momentum_reward_is_negative_centroidal_residual():
-    """Paper Eq. (2) must be a cost, not an activity bonus for shaking legs."""
+    """论文公式 (2) 必须是成本项，不能把双腿晃动误当成活动奖励。"""
 
     class FakeData:
         body_mass = torch.ones(1, 2)
@@ -176,14 +177,15 @@ def test_leg_momentum_reward_is_negative_centroidal_residual():
 
 
 def test_centroidal_momentum_rotates_physx_link_inertia_to_world_frame():
-    """World angular velocity must use the link-frame inertia in world coordinates."""
+    """用世界系角速度计算动量时，必须先把连杆惯量旋转到世界坐标系。"""
 
     angle = torch.tensor(torch.pi / 4.0)
+
     class FakeData:
         body_mass = torch.ones(1, 2)
         body_com_pos_w = torch.zeros(1, 2, 3)
         body_com_vel_w = torch.tensor([[[0.0, 0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])
-        # PhysX's column-major flattening leaves this diagonal matrix unchanged.
+        # PhysX 按列优先展开；这个对角矩阵在该展开规则下数值顺序不变。
         body_inertia = torch.tensor([[[1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0], [0.0] * 9]])
         body_link_quat_w = torch.tensor(
             [[[0.0, torch.sin(angle / 2.0), 0.0, torch.cos(angle / 2.0)], [0.0, 0.0, 0.0, 1.0]]]
@@ -191,12 +193,13 @@ def test_centroidal_momentum_rotates_physx_link_inertia_to_world_frame():
 
     total_z, _ = my_exoskeleton_flat._centroidal_angular_momentum_z(FakeData())
 
-    # R_y(pi/4) diag(1,2,3) R_y(pi/4)^T has I_zx=1, so L_z=I_zx*omega_x=1.
+    # ``R_y(pi/4) diag(1,2,3) R_y(pi/4)^T`` 的 ``I_zx=1``，所以最终结果为
+    # ``L_z=I_zx*omega_x=1``，正好可用于核对坐标变换是否正确。
     assert torch.isclose(total_z, torch.tensor([1.0]), atol=1.0e-5).all()
 
 
 def test_first_curriculum_phase_starts_with_fixed_forward_walk_command():
-    """Phase one retains the stable fixed-forward task before adding transitions."""
+    """第一阶段应先保留稳定的固定前进任务，再逐步加入步态过渡。"""
     cfg = MyExoskeletonFlatEnvCfg()
     command = cfg.commands.base_velocity
 
@@ -213,10 +216,15 @@ def test_first_curriculum_phase_starts_with_fixed_forward_walk_command():
 
 
 def test_fixed_forward_walk_reward_requires_forward_motion_at_target_speed():
-    """Standing, reverse, overspeed, lateral, and turning motion score below the target."""
+    """给定七种代表性运动，只有按目标速度直行的环境才能得到满分。
+
+    这个黄金向量专门防止“保持站立也有高奖励”的捷径，同时确认倒退、过快、横移和
+    原地转向都不会被当作完成固定正前方行走任务。
+    """
     target_speed = 0.2
 
     class FakeData:
+        # 七行依次表示：目标速度直行、站立、倒退、过快、速度不足、横移、转向。
         root_lin_vel_b = torch.tensor(
             [
                 [target_speed, 0.0, 0.0],
@@ -264,7 +272,7 @@ def test_fixed_forward_walk_reward_requires_forward_motion_at_target_speed():
 
 
 def test_low_speed_velocity_tracking_gate_removes_stationary_shortcut():
-    """The phase-one tracker must not pay a full reward for zero forward speed."""
+    """第一阶段的跟踪奖励不得给零前进速度满分。"""
 
     class FakeData:
         root_lin_vel_b = torch.tensor([[0.0, 0.0, 0.0], [0.2, 0.0, 0.0]])
@@ -292,7 +300,7 @@ def test_low_speed_velocity_tracking_gate_removes_stationary_shortcut():
 
 
 def test_phase_contact_requires_the_complete_single_support_pattern(monkeypatch):
-    """Double support must not receive half credit in the walking route."""
+    """给定双脚/单脚接触组合，普通行走只奖励与相位一致的完整单支撑模式。"""
     gait_modes = torch.full((3,), 1, dtype=torch.long)
 
     class FakeCommandTerm:
@@ -319,7 +327,7 @@ def test_phase_contact_requires_the_complete_single_support_pattern(monkeypatch)
 
 
 def test_phase_contact_allows_run_flight_but_rejects_double_support(monkeypatch):
-    """Running accepts phase-aligned flight while retaining exclusive support."""
+    """跑步允许与相位一致的腾空，同时仍应保留单脚支撑判定。"""
     gait_modes = torch.full((4,), 3, dtype=torch.long)
 
     class FakeCommandTerm:
@@ -346,7 +354,7 @@ def test_phase_contact_allows_run_flight_but_rejects_double_support(monkeypatch)
 
 
 def test_w2s_contact_accepts_double_support_without_relaxing_walk(monkeypatch):
-    """The W2S landing ramps into double support, while no-contact remains invalid."""
+    """走转站（W2S）着地过程应渐进进入双脚支撑，无接触状态仍然无效。"""
     gait_modes = torch.full((3,), 2, dtype=torch.long)
 
     class FakeCommandTerm:
@@ -376,7 +384,7 @@ def test_w2s_contact_accepts_double_support_without_relaxing_walk(monkeypatch):
 
 
 def test_contact_reward_is_binary_instead_of_force_scaled(monkeypatch):
-    """A large impact force must not create an unbounded positive reward."""
+    """很大的冲击力不得产生无上限的正奖励。"""
 
     class FakeEnv:
         num_envs = 3
@@ -396,7 +404,7 @@ def test_contact_reward_is_binary_instead_of_force_scaled(monkeypatch):
 
 
 def test_sensor_stats_reads_supported_normal_force_api():
-    """PhysX contact features should not use the warning-only total-force alias."""
+    """PhysX 接触特征不应使用只会发出警告的总力别名。"""
 
     class FakeData:
         net_normal_forces_w = torch.tensor(
@@ -423,7 +431,7 @@ def test_sensor_stats_reads_supported_normal_force_api():
 
 
 def test_standing_feet_alignment_reward_is_limited_to_two_feet():
-    """Keep the standing foot-heading term limited to the two foot bodies."""
+    """站立时的脚朝向项必须只读取左右两个脚部刚体。"""
     cfg = MyExoskeletonFlatEnvCfg()
     term = cfg.rewards.stand_feet_alignment
 
@@ -435,7 +443,7 @@ def test_standing_feet_alignment_reward_is_limited_to_two_feet():
 
 
 def test_exoskeleton_imus_support_selectable_kit_debug_probes():
-    """All IMUs should delay-load the custom implementation and leave training probes off."""
+    """所有 IMU 都应延迟加载自定义实现，并默认关闭训练探针。"""
     cfg = MyExoskeletonFlatEnvCfg()
 
     for sensor_name in ("imu_rthigh", "imu_rleg", "imu_rfoot", "imu_lthigh", "imu_lleg", "imu_lfoot"):
@@ -445,7 +453,11 @@ def test_exoskeleton_imus_support_selectable_kit_debug_probes():
 
 
 def test_feet_forward_alignment_reward_uses_yaw_and_straight_command_gate():
-    """Aligned feet score well; yaw offsets and non-straight commands do not."""
+    """给定五种脚尖朝向与命令组合，只在直行命令下评价双脚相对机身的偏航角。
+
+    第三行让机身和双脚一起旋转 0.5 rad，验证奖励比较的是相对朝向，而不是错误地要求
+    世界坐标偏航角永远为零；最后两行验证横移或转向命令会关闭这项直行奖励。
+    """
 
     def yaw_quat(yaw):
         return torch.stack(
@@ -513,14 +525,14 @@ def test_feet_forward_alignment_reward_uses_yaw_and_straight_command_gate():
 
 
 def test_knee_limit_penalty_and_termination_respect_each_leg_sign():
-    """Right-positive and left-negative angles are reverse-bend violations."""
+    """给定正常弯曲与左右各一次反弯，惩罚和终止必须遵守两膝相反的关节符号。"""
 
     class FakeData:
         joint_pos = torch.tensor(
             [
-                [-1.0, 1.0],  # both valid flexion angles
-                [0.20, 1.0],  # right reverse bend
-                [-1.0, -0.20],  # left reverse bend
+                [-1.0, 1.0],  # 左右膝都按人体允许方向弯曲。
+                [0.20, 1.0],  # 右膝符号为正，表示右腿反向弯曲。
+                [-1.0, -0.20],  # 左膝符号为负，表示左腿反向弯曲。
             ]
         )
         joint_vel = torch.zeros(3, 2)
@@ -542,10 +554,10 @@ def test_knee_limit_penalty_and_termination_respect_each_leg_sign():
 
 
 def test_human_knee_gait_reward_maps_flexion_per_side(monkeypatch):
-    """The same anatomical flexion should score equally on mirrored knees."""
+    """左右镜像膝关节具有相同解剖屈曲角时，应得到相同分数。"""
 
     class FakeData:
-        # q_R=-0.8 and q_L=+0.8 are both 0.8 rad anatomical flexion.
+        # ``q_R=-0.8`` 和 ``q_L=+0.8`` 都表示 0.8 rad 的解剖屈曲角。
         joint_pos = torch.tensor([[-0.8, 0.8], [0.0, 0.0]])
 
     class FakeRobot:
@@ -563,7 +575,7 @@ def test_human_knee_gait_reward_maps_flexion_per_side(monkeypatch):
         scene = {"robot": FakeRobot()}
         command_manager = FakeCommandManager()
 
-    # First row: both swing; second row: both stance.
+    # 第一行表示双腿摆动，第二行表示双腿支撑。
     monkeypatch.setattr(
         my_exoskeleton_flat,
         "_foot_contacts",

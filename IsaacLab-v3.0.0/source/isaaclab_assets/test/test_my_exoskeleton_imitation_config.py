@@ -1,4 +1,9 @@
-"""Config-only and Kit-less sequence checks for the multimodal imitation task."""
+"""多模态模仿环境配置与教师目标序列的无 Kit 回归测试。
+
+本文件保护4096环境默认场景、相机/IMU命名和固定观测 shape，并重点检查多个并行环境
+共享缓存时的局部 reset：只重置一行不能截断其他环境仍在使用的序列，done 环境不能
+继续推进旧目标，非周期任务到末尾必须保持最后一帧而不是突然跳回开头。
+"""
 
 from types import SimpleNamespace
 
@@ -20,9 +25,8 @@ def test_imitation_config_uses_fixed_4096_scene_and_camera_contract():
     assert cfg.scene.left_rgb_camera.prim_path == "{ENV_REGEX_NS}/left_rgb_camera"
     assert cfg.scene.right_rgb_camera.prim_path == "{ENV_REGEX_NS}/right_rgb_camera"
 
-    # The channel dimensions are authored as scene geometry, not only as
-    # metadata properties.  This keeps the footprint visible in Viser/Newton
-    # and in the fixed side-camera images.
+    # 通道尺寸直接写成场景几何体，而不只是元数据属性。这样在 Viser/Newton 以及固定
+    # 侧视相机画面中都能看见通道占用范围。
     assert cfg.scene.channel_floor.prim_path == "{ENV_REGEX_NS}/Channel/Floor"
     assert cfg.scene.channel_floor.spawn.size == (2.4, 2.4, 0.012)
     assert cfg.scene.channel_left_edge.prim_path == "{ENV_REGEX_NS}/Channel/LeftEdge"
@@ -49,7 +53,7 @@ def test_imitation_config_exposes_six_recorder_imus_and_task_selector():
 
 
 def test_optional_sensor_switches_default_on_and_preserve_shape_contract():
-    """Sensor flags are enabled by default and do not alter declared spaces."""
+    """传感器开关默认启用，而且不得改变已经声明的观测空间。"""
 
     cfg = MyExoskeletonImitationEnvCfg()
     assert cfg.use_imu is True
@@ -69,7 +73,11 @@ def test_optional_sensor_switches_default_on_and_preserve_shape_contract():
 
 
 def _make_sequence_test_env() -> SimpleNamespace:
-    """Build the small state surface used by the target-sequence methods."""
+    """构造只含目标序列字段的两行假环境，用固定值隔离检查缓冲区索引逻辑。
+
+    序列缓存填 9、当前目标填 99，使测试能一眼判断某一行是被正确读取、保持不变，
+    还是在局部 reset 时被另一环境意外覆盖。
+    """
 
     class Cfg:
         imitation_random_task_sampling = False
@@ -105,7 +113,7 @@ def _make_sequence_test_env() -> SimpleNamespace:
 
 
 def test_target_sequence_partial_reset_preserves_other_environment_buffer():
-    """A short reset window must not truncate an active environment's sequence."""
+    """只重置环境0并装入一帧短序列时，环境1的四帧缓存和当前目标必须原样保留。"""
 
     env = _make_sequence_test_env()
     env._select_task_ids = lambda env_ids: ["BT02" for _ in range(env_ids.numel())]
@@ -135,7 +143,7 @@ def test_target_sequence_partial_reset_preserves_other_environment_buffer():
 
 
 def test_target_sequence_advance_skips_done_environments():
-    """Only active environments advance; done environments retain cursor and target."""
+    """给定环境1已经 done，推进序列时只能移动环境0的游标和当前目标。"""
 
     env = _make_sequence_test_env()
     env._imitation_target_cursor[:] = torch.tensor([0, 2])
@@ -148,7 +156,7 @@ def test_target_sequence_advance_skips_done_environments():
 
 
 def test_non_cyclic_target_sequence_holds_final_frame():
-    """Transition recordings must not jump from stop back to their start pose."""
+    """过渡动作记录播放到终点后，不得从静止姿态突然跳回起始姿态。"""
 
     env = _make_sequence_test_env()
     env._imitation_sequence_loop_per_env = torch.tensor([False, True])

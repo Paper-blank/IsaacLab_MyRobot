@@ -309,8 +309,7 @@ class SafetyLimiter:
             if (
                 previous is not None
                 and limit.jerk_max_rad_s3 is not None
-                and abs((acceleration[index] - previous.acceleration_rad_s2[index]) / dt_s)
-                > limit.jerk_max_rad_s3
+                and abs((acceleration[index] - previous.acceleration_rad_s2[index]) / dt_s) > limit.jerk_max_rad_s3
             ):
                 raise SafetyViolation(f"{self.joint_names[index]} exceeds its jerk limit")
         result = JointSample(command.timestamp_s, angle, velocity, acceleration)
